@@ -1,0 +1,7 @@
+# Trigger strings for the first PoC matcher.
+#
+# These values must not contain punctuation that the converter treats as body
+# separators: comma, period, question mark, exclamation mark, minus, plus,
+# ellipsis, tilde, or double quote, including their Chinese/full-width variants.
+trigger_prefix = ";;"
+trigger_suffix = ";;"

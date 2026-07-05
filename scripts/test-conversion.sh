@@ -36,28 +36,29 @@ cargo fmt --check
 cargo test
 
 run_case() {
-  local input="$1"
-  local expected="$2"
+  local expected="$1"
+  shift
   local output
   local actual
 
-  output="$(cargo run --quiet -- "$input")"
+  output="$(cargo run --quiet -- "$@")"
   actual="$(printf '%s\n' "$output" | sed -n 's/^output:[[:space:]]*//p')"
 
   if [[ "$actual" != "$expected" ]]; then
     echo "case failed" >&2
-    echo "input:    $input" >&2
+    echo "args:     $*" >&2
     echo "expected: $expected" >&2
     echo "actual:   $actual" >&2
     echo "$output" >&2
     exit 1
   fi
 
-  printf 'ok: %s => %s\n' "$input" "$actual"
+  printf 'ok: %s => %s\n' "$*" "$actual"
 }
 
-run_case ';;"hao","zaijian","nihaoma","woyaoceshi";;' '“好”，“再见”，“你好吗”，“我要测试”'
-run_case ';;woyaoceshizhongwenshurufa,nihaoma!"hao...zaijian"-jiahao+wenhao~;;' '我要测试中文输入法，你好吗！“好……再见”－加号＋问号～'
-run_case ';;hao……zaijian,nihaoma;;' '好……再见，你好吗'
+run_case '“好”，“再见”，“你好吗”，“我要测试”' ';;"hao","zaijian","nihaoma","woyaoceshi";;'
+run_case '我要测试中文输入法，你好吗！“好……再见”－加号＋问号～' ';;woyaoceshizhongwenshurufa,nihaoma!"hao...zaijian"-jiahao+wenhao~;;'
+run_case '好……再见，你好吗' ';;hao……zaijian,nihaoma;;'
+run_case '我爱OpenAI，用Rust开发' --conversion-mode rime-auto ';;wo ai OpenAI,yong Rust kaifa;;'
 
 echo "all conversion smoke tests passed"

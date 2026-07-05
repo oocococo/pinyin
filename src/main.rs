@@ -45,18 +45,27 @@ struct Options {
 struct AppConfig {
     trigger_prefix: String,
     trigger_suffix: String,
+    conversion_mode: ConversionMode,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct FileConfig {
     trigger_prefix: Option<String>,
     trigger_suffix: Option<String>,
+    conversion_mode: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum Token {
     Pinyin(String),
     Separator(String),
+    RimeAuto(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConversionMode {
+    Segmented,
+    RimeAuto,
 }
 
 #[derive(Debug)]
@@ -163,6 +172,10 @@ impl Options {
         let mut doctor = false;
         let mut listen = false;
         let mut log_events = env_flag("RIME_POC_LOG_EVENTS");
+        let mut conversion_mode_override = env::var("RIME_POC_CONVERSION_MODE")
+            .ok()
+            .map(|value| ConversionMode::parse(&value))
+            .transpose()?;
         let mut max_buffer_chars = env::var("RIME_POC_MAX_BUFFER_CHARS")
             .ok()
             .map(|value| parse_usize(&value, "RIME_POC_MAX_BUFFER_CHARS"))
@@ -190,6 +203,12 @@ impl Options {
                 "--config" => {
                     config_path = Some(PathBuf::from(next_arg(&mut args, "--config")?));
                 }
+                "--conversion-mode" => {
+                    conversion_mode_override = Some(ConversionMode::parse(&next_arg(
+                        &mut args,
+                        "--conversion-mode",
+                    )?)?);
+                }
                 "--listen" => listen = true,
                 "--log-events" => log_events = true,
                 "--max-buffer-chars" => {
@@ -215,7 +234,10 @@ impl Options {
             }
         }
 
-        let (config, config_path) = load_config(config_path)?;
+        let (mut config, config_path) = load_config(config_path)?;
+        if let Some(conversion_mode) = conversion_mode_override {
+            config.conversion_mode = conversion_mode;
+        }
         validate_config(&config)?;
         validate_runtime_options(max_buffer_chars, inject_delay_ms)?;
 
@@ -241,6 +263,26 @@ impl Default for AppConfig {
         Self {
             trigger_prefix: DEFAULT_TRIGGER.to_owned(),
             trigger_suffix: DEFAULT_TRIGGER.to_owned(),
+            conversion_mode: ConversionMode::Segmented,
+        }
+    }
+}
+
+impl ConversionMode {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "segmented" | "segment" => Ok(Self::Segmented),
+            "rime-auto" | "rime_auto" | "auto" => Ok(Self::RimeAuto),
+            _ => {
+                bail!("invalid conversion mode {value:?}; expected \"segmented\" or \"rime-auto\"")
+            }
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Segmented => "segmented",
+            Self::RimeAuto => "rime-auto",
         }
     }
 }
@@ -276,6 +318,11 @@ fn load_config(config_path: Option<PathBuf>) -> Result<(AppConfig, Option<PathBu
             trigger_suffix: file_config
                 .trigger_suffix
                 .unwrap_or(defaults.trigger_suffix),
+            conversion_mode: file_config
+                .conversion_mode
+                .map(|value| ConversionMode::parse(&value))
+                .transpose()?
+                .unwrap_or(defaults.conversion_mode),
         },
         Some(path),
     ))
@@ -397,6 +444,10 @@ fn run_conversion(options: &Options, body: String) -> Result<()> {
     println!("schema:          {}", options.schema);
     println!("trigger_prefix:  {:?}", options.config.trigger_prefix);
     println!("trigger_suffix:  {:?}", options.config.trigger_suffix);
+    println!(
+        "conversion_mode: {}",
+        options.config.conversion_mode.as_str()
+    );
     match &options.config_path {
         Some(path) => println!("config:          {}", path.display()),
         None => println!("config:          <defaults>"),
@@ -409,6 +460,7 @@ fn run_conversion(options: &Options, body: String) -> Result<()> {
         match token {
             Token::Pinyin(raw) => println!("  pinyin:    {raw}"),
             Token::Separator(value) => println!("  separator: {value}"),
+            Token::RimeAuto(raw) => println!("  rime-auto: {raw}"),
         }
     }
 
@@ -630,6 +682,13 @@ extern "C" fn mac_event_callback(event: mac::InputEvent) {
 }
 
 fn convert_body(options: &Options, body: String) -> Result<ConversionOutput> {
+    match options.config.conversion_mode {
+        ConversionMode::Segmented => convert_body_segmented(options, body),
+        ConversionMode::RimeAuto => convert_body_rime_auto(options, body),
+    }
+}
+
+fn convert_body_segmented(options: &Options, body: String) -> Result<ConversionOutput> {
     let tokens = tokenize_body(&body);
     let mut output = String::new();
     let mut segments = Vec::new();
@@ -649,6 +708,9 @@ fn convert_body(options: &Options, body: String) -> Result<ConversionOutput> {
             Token::Separator(value) => {
                 output.push_str(&map_separator(value, &mut quote_state));
             }
+            Token::RimeAuto(_) => {
+                unreachable!("rime-auto tokens are not produced by segmented tokenization")
+            }
         }
     }
 
@@ -657,6 +719,54 @@ fn convert_body(options: &Options, body: String) -> Result<ConversionOutput> {
         output,
         tokens,
         segments,
+    })
+}
+
+fn convert_body_rime_auto(options: &Options, body: String) -> Result<ConversionOutput> {
+    let mut session = create_selected_session(&options.schema)?;
+    let mut output = String::new();
+
+    for ch in body.chars() {
+        let status = session.process_key(KeyEvent::new(ch as u32, 0));
+        if matches!(status, KeyStatus::Pass) {
+            output.push(ch);
+        }
+
+        if let Some(commit) = session.commit() {
+            output.push_str(commit.text());
+        }
+    }
+
+    let mut preedit = "<none>".to_owned();
+    let mut final_candidate = None;
+    if let Some(context) = session.context() {
+        let composition = context.composition();
+        preedit = composition.preedit.unwrap_or("<none>").to_owned();
+        final_candidate = context
+            .menu()
+            .candidates
+            .first()
+            .map(|candidate| candidate.text.to_owned());
+    }
+
+    if let Some(candidate) = final_candidate {
+        output.push_str(&candidate);
+    }
+
+    let segment = ConvertedSegment {
+        raw: body.clone(),
+        normalized: body.clone(),
+        preedit,
+        first: output.clone(),
+    };
+
+    session.close().context("failed to close Rime session")?;
+
+    Ok(ConversionOutput {
+        body: body.clone(),
+        output,
+        tokens: vec![Token::RimeAuto(body)],
+        segments: vec![segment],
     })
 }
 
@@ -997,6 +1107,10 @@ fn print_doctor(options: &Options) {
     println!("config:          {:?}", options.config_path);
     println!("trigger_prefix:  {:?}", options.config.trigger_prefix);
     println!("trigger_suffix:  {:?}", options.config.trigger_suffix);
+    println!(
+        "conversion_mode: {}",
+        options.config.conversion_mode.as_str()
+    );
     println!("body_mode:       {}", options.body_mode);
     println!("listen:          {}", options.listen);
     println!("max_buffer_chars: {}", options.max_buffer_chars);
@@ -1057,6 +1171,7 @@ fn print_help() {
         "Usage: rime-poc [OPTIONS] <triggered-text>\n\n\
 Options:\n  \
 --config <FILE>          Trigger config file [env: RIME_POC_CONFIG] [default: ./rime-poc.toml if present]\n  \
+--conversion-mode <MODE> Conversion mode: segmented or rime-auto [env: RIME_POC_CONVERSION_MODE]\n  \
 --listen                 Start macOS global listener mode\n  \
 --log-events             Print every key/mouse event seen by the listener [env: RIME_POC_LOG_EVENTS]\n  \
 --body                   Treat input as body text without requiring trigger prefix/suffix\n  \
@@ -1079,6 +1194,7 @@ mod tests {
         let config = AppConfig {
             trigger_prefix: "[[".to_owned(),
             trigger_suffix: "]]".to_owned(),
+            conversion_mode: ConversionMode::Segmented,
         };
 
         let body = extract_body("[[woyaoceshi]]", &config, false).unwrap();
@@ -1091,6 +1207,7 @@ mod tests {
         let config = AppConfig {
             trigger_prefix: ";;".to_owned(),
             trigger_suffix: "?".to_owned(),
+            conversion_mode: ConversionMode::Segmented,
         };
 
         let error = validate_config(&config).unwrap_err().to_string();
@@ -1100,6 +1217,7 @@ mod tests {
         let config = AppConfig {
             trigger_prefix: "!".to_owned(),
             trigger_suffix: ";;".to_owned(),
+            conversion_mode: ConversionMode::Segmented,
         };
 
         let error = validate_config(&config).unwrap_err().to_string();
@@ -1151,5 +1269,18 @@ mod tests {
             .collect::<String>();
 
         assert_eq!(mapped_quotes, "“”“”");
+    }
+
+    #[test]
+    fn parses_conversion_modes() {
+        assert_eq!(
+            ConversionMode::parse("segmented").unwrap(),
+            ConversionMode::Segmented
+        );
+        assert_eq!(
+            ConversionMode::parse("rime-auto").unwrap(),
+            ConversionMode::RimeAuto
+        );
+        assert!(ConversionMode::parse("unknown").is_err());
     }
 }

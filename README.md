@@ -166,6 +166,30 @@ The debug log is written under:
 dist/rime-poc-macos/logs
 ```
 
+Package a portable zip that bundles `librime`, its Homebrew dylib
+dependencies, and the Rime data files:
+
+```sh
+bash scripts/package-portable-macos.sh
+```
+
+The portable directory and zip are written to:
+
+```text
+dist/rime-poc-macos-portable
+dist/rime-poc-macos-portable.zip
+```
+
+On the target Mac, unzip it, grant Accessibility and Input Monitoring
+permissions to `rime-poc-macos-portable/rime-poc`, then run:
+
+```sh
+./run-listener.sh
+```
+
+The portable zip does not require Homebrew on the target Mac. macOS permissions
+still need to be granted per machine.
+
 Download minimal Rime data for this PoC:
 
 ```sh
@@ -175,10 +199,10 @@ export RIME_USER_DATA_DIR="$PWD/data/user"
 export RIME_SCHEMA=luna_pinyin_simp
 ```
 
-The CLI/listener strips the configured prefix/suffix, splits the body into
-pinyin runs and separators, sends each pinyin run to Rime independently, then
-rejoins the converted text. Half-width separators are converted where there is a
-Chinese punctuation equivalent:
+The CLI/listener strips the configured prefix/suffix. In the default
+`segmented` mode, it splits the body into pinyin runs and separators, sends each
+pinyin run to Rime independently, then rejoins the converted text. Half-width
+separators are converted where there is a Chinese punctuation equivalent:
 
 ```text
 ,  -> ，
@@ -191,6 +215,24 @@ Chinese punctuation equivalent:
 ~  -> ～
 "  -> “ / ”
 ```
+
+For an experimental mixed Chinese/English trial, switch to `rime-auto`. This
+feeds the whole body to one Rime session and lets the active schema decide when
+to commit text and how to handle English-looking input:
+
+```sh
+cargo run -- --conversion-mode rime-auto ';;wo ai OpenAI,yong Rust kaifa;;'
+```
+
+The same mode can be set in `rime-poc.toml`:
+
+```toml
+conversion_mode = "rime-auto"
+```
+
+`rime-auto` is intentionally experimental. It is useful for measuring Rime's
+native mixed-input behavior, while `segmented` remains the safer default for
+predictable auto-replacement.
 
 The CLI prints the body, final output, tokenization, and each Rime segment's
 preedit/first candidate. It exits with an error if `librime`, schema data, or

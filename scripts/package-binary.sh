@@ -105,6 +105,12 @@ rime-poc macOS binary package
 
 Expected output:
    我要测试中文输入法，你好吗！
+
+Experimental mixed Chinese/English mode:
+   ./run-listener.sh --conversion-mode rime-auto
+
+Or edit rime-poc.toml:
+   conversion_mode = "rime-auto"
 README
 
 echo "Packaged binary:"

@@ -5,3 +5,11 @@
 # ellipsis, tilde, or double quote, including their Chinese/full-width variants.
 trigger_prefix = ";;"
 trigger_suffix = ";;"
+
+# Conversion modes:
+# - "segmented": stable default. Split body into pinyin runs and separators,
+#   convert each pinyin run independently, and map punctuation ourselves.
+# - "rime-auto": experimental. Feed the whole body to one Rime session and let
+#   Rime decide commits/candidates, including any mixed Chinese/English behavior
+#   provided by the active schema.
+conversion_mode = "segmented"

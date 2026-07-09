@@ -7,12 +7,27 @@ use anyhow::Result;
 
 pub const EVENT_KEYBOARD: i32 = 1;
 pub const EVENT_MOUSE: i32 = 2;
+pub const EVENT_CONTEXT: i32 = 3;
 pub const STATUS_PRESSED: i32 = 1;
+
+pub const MODIFIER_COMMAND: u32 = 1 << 0;
+pub const MODIFIER_CONTROL: u32 = 1 << 1;
+pub const MODIFIER_OPTION: u32 = 1 << 2;
 
 pub const KEY_BACKSPACE: u32 = 51;
 pub const KEY_ENTER: u32 = 36;
 pub const KEY_RETURN: u32 = 76;
 pub const KEY_ESCAPE: u32 = 53;
+pub const KEY_A: u32 = 0;
+pub const KEY_C: u32 = 8;
+pub const KEY_V: u32 = 9;
+pub const KEY_W: u32 = 13;
+pub const KEY_X: u32 = 7;
+pub const KEY_Z: u32 = 6;
+pub const KEY_SHIFT_LEFT: u32 = 56;
+pub const KEY_SHIFT_RIGHT: u32 = 60;
+pub const KEY_TAB: u32 = 48;
+pub const KEY_GRAVE: u32 = 50;
 pub const KEY_ARROW_LEFT: u32 = 123;
 pub const KEY_ARROW_RIGHT: u32 = 124;
 pub const KEY_ARROW_DOWN: u32 = 125;
@@ -24,8 +39,11 @@ pub struct InputEvent {
     pub event_type: c_int,
     pub status: c_int,
     pub key_code: c_uint,
+    pub modifier_flags: c_uint,
     pub buffer: [c_char; 64],
     pub buffer_len: usize,
+    pub source_buffer: [c_char; 256],
+    pub source_buffer_len: usize,
 }
 
 impl InputEvent {
@@ -36,6 +54,30 @@ impl InputEvent {
             .map(|ch| *ch as u8)
             .collect::<Vec<_>>();
         String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    pub fn input_source_fingerprint(&self) -> String {
+        let len = self.source_buffer_len.min(self.source_buffer.len());
+        let bytes = self.source_buffer[..len]
+            .iter()
+            .map(|ch| *ch as u8)
+            .collect::<Vec<_>>();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    pub fn has_command_modifier(&self) -> bool {
+        let flags = self.modifier_flags as u32;
+        flags & MODIFIER_COMMAND != 0
+    }
+
+    pub fn has_control_modifier(&self) -> bool {
+        let flags = self.modifier_flags as u32;
+        flags & MODIFIER_CONTROL != 0
+    }
+
+    pub fn has_text_modifier(&self) -> bool {
+        let flags = self.modifier_flags as u32;
+        flags & (MODIFIER_COMMAND | MODIFIER_CONTROL | MODIFIER_OPTION) != 0
     }
 }
 

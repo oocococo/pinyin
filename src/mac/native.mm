@@ -1,5 +1,6 @@
 #import <AppKit/AppKit.h>
 #import <ApplicationServices/ApplicationServices.h>
+#import <Carbon/Carbon.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <Foundation/Foundation.h>
 
@@ -16,6 +17,7 @@ extern "C" {
 enum {
   PAL_INPUT_EVENT_KEYBOARD = 1,
   PAL_INPUT_EVENT_MOUSE = 2,
+  PAL_INPUT_EVENT_CONTEXT = 3,
 };
 
 enum {
@@ -27,8 +29,11 @@ typedef struct {
   int32_t event_type;
   int32_t status;
   uint32_t key_code;
+  uint32_t modifier_flags;
   char buffer[64];
   uintptr_t buffer_len;
+  char source_buffer[256];
+  uintptr_t source_buffer_len;
 } PalInputEvent;
 
 typedef void (*PalEventCallback)(PalInputEvent event);
@@ -38,9 +43,18 @@ typedef void (*PalEventCallback)(PalInputEvent event);
 static constexpr CGFloat PAL_EVENT_MARKER = -27469;
 static PalEventCallback PAL_CALLBACK = nullptr;
 static id PAL_MONITOR = nil;
+static id PAL_WORKSPACE_OBSERVER = nil;
+static id PAL_INPUT_SOURCE_OBSERVER = nil;
 static CFMachPortRef PAL_EVENT_TAP = nullptr;
 static CFRunLoopSourceRef PAL_EVENT_TAP_SOURCE = nullptr;
 static bool PAL_LOG_EVENTS = false;
+
+enum {
+  PAL_INPUT_MODIFIER_COMMAND = 1 << 0,
+  PAL_INPUT_MODIFIER_CONTROL = 1 << 1,
+  PAL_INPUT_MODIFIER_OPTION = 1 << 2,
+  PAL_INPUT_MODIFIER_SHIFT = 1 << 3,
+};
 
 static bool native_event_logging_enabled() {
   const char *value = getenv("RIME_POC_NATIVE_LOG_EVENTS");
@@ -60,6 +74,67 @@ static void post_key(uint16_t key_code, bool down, int32_t delay_ms) {
   CGEventPost(kCGHIDEventTap, event);
   CFRelease(event);
   usleep(delay_ms * 1000);
+}
+
+static uint32_t pal_modifier_flags_from_cg(CGEventFlags flags) {
+  uint32_t result = 0;
+  if ((flags & kCGEventFlagMaskCommand) != 0) {
+    result |= PAL_INPUT_MODIFIER_COMMAND;
+  }
+  if ((flags & kCGEventFlagMaskControl) != 0) {
+    result |= PAL_INPUT_MODIFIER_CONTROL;
+  }
+  if ((flags & kCGEventFlagMaskAlternate) != 0) {
+    result |= PAL_INPUT_MODIFIER_OPTION;
+  }
+  if ((flags & kCGEventFlagMaskShift) != 0) {
+    result |= PAL_INPUT_MODIFIER_SHIFT;
+  }
+  return result;
+}
+
+static uint32_t pal_modifier_flags_from_ns(NSEventModifierFlags flags) {
+  uint32_t result = 0;
+  if ((flags & NSEventModifierFlagCommand) != 0) {
+    result |= PAL_INPUT_MODIFIER_COMMAND;
+  }
+  if ((flags & NSEventModifierFlagControl) != 0) {
+    result |= PAL_INPUT_MODIFIER_CONTROL;
+  }
+  if ((flags & NSEventModifierFlagOption) != 0) {
+    result |= PAL_INPUT_MODIFIER_OPTION;
+  }
+  if ((flags & NSEventModifierFlagShift) != 0) {
+    result |= PAL_INPUT_MODIFIER_SHIFT;
+  }
+  return result;
+}
+
+static void copy_current_input_source_fingerprint(PalInputEvent *input);
+
+static void dispatch_context_event(const char *reason) {
+  if (PAL_CALLBACK == nullptr) {
+    return;
+  }
+
+  PalInputEvent input = {};
+  input.event_type = PAL_INPUT_EVENT_CONTEXT;
+  input.status = PAL_INPUT_STATUS_PRESSED;
+  input.key_code = 0;
+  strncpy(input.buffer, reason, sizeof(input.buffer) - 1);
+  input.buffer[sizeof(input.buffer) - 1] = '\0';
+  input.buffer_len = strlen(input.buffer);
+  copy_current_input_source_fingerprint(&input);
+
+  if (PAL_LOG_EVENTS) {
+    fprintf(stderr,
+            "[rime-poc native] context event reason=%s source=%s\n",
+            reason,
+            input.source_buffer_len > 0 ? input.source_buffer : "<unknown>");
+    fflush(stderr);
+  }
+
+  PAL_CALLBACK(input);
 }
 
 extern "C" bool pal_pinyin_is_accessibility_trusted(bool prompt) {
@@ -91,19 +166,75 @@ extern "C" bool pal_pinyin_request_input_monitoring_access() {
   return true;
 }
 
-static void copy_string_to_input_buffer(PalInputEvent *input, CFStringRef string) {
-  if (string == nullptr) {
+static void copy_cf_string_to_buffer(
+    CFStringRef string,
+    char *buffer,
+    uintptr_t *buffer_len,
+    size_t buffer_capacity) {
+  if (string == nullptr || buffer == nullptr || buffer_len == nullptr || buffer_capacity == 0) {
     return;
   }
 
   if (CFStringGetCString(
           string,
-          input->buffer,
-          sizeof(input->buffer),
+          buffer,
+          buffer_capacity,
           kCFStringEncodingUTF8)) {
-    input->buffer[sizeof(input->buffer) - 1] = '\0';
-    input->buffer_len = strlen(input->buffer);
+    buffer[buffer_capacity - 1] = '\0';
+    *buffer_len = strlen(buffer);
   }
+}
+
+static void copy_string_to_input_buffer(PalInputEvent *input, CFStringRef string) {
+  copy_cf_string_to_buffer(
+      string,
+      input->buffer,
+      &input->buffer_len,
+      sizeof(input->buffer));
+}
+
+static void copy_current_input_source_fingerprint(PalInputEvent *input) {
+  TISInputSourceRef source = TISCopyCurrentKeyboardInputSource();
+  if (source == nullptr) {
+    return;
+  }
+
+  CFStringRef source_id = (CFStringRef)TISGetInputSourceProperty(
+      source,
+      kTISPropertyInputSourceID);
+  CFStringRef mode_id = (CFStringRef)TISGetInputSourceProperty(
+      source,
+      kTISPropertyInputModeID);
+  CFStringRef source_type = (CFStringRef)TISGetInputSourceProperty(
+      source,
+      kTISPropertyInputSourceType);
+  CFBooleanRef ascii_capable = (CFBooleanRef)TISGetInputSourceProperty(
+      source,
+      kTISPropertyInputSourceIsASCIICapable);
+
+  CFStringRef empty = CFSTR("");
+  CFStringRef source_id_value = source_id != nullptr ? source_id : empty;
+  CFStringRef mode_id_value = mode_id != nullptr ? mode_id : empty;
+  CFStringRef source_type_value = source_type != nullptr ? source_type : empty;
+  int ascii_capable_value = ascii_capable == kCFBooleanTrue ? 1 : 0;
+
+  CFStringRef fingerprint = CFStringCreateWithFormat(
+      kCFAllocatorDefault,
+      nullptr,
+      CFSTR("source=%@|mode=%@|type=%@|ascii=%d"),
+      source_id_value,
+      mode_id_value,
+      source_type_value,
+      ascii_capable_value);
+  if (fingerprint != nullptr) {
+    copy_cf_string_to_buffer(
+        fingerprint,
+        input->source_buffer,
+        &input->source_buffer_len,
+        sizeof(input->source_buffer));
+    CFRelease(fingerprint);
+  }
+  CFRelease(source);
 }
 
 static void copy_cg_event_text(PalInputEvent *input, CGEventRef event) {
@@ -142,24 +273,34 @@ static void dispatch_cg_event(CGEventType type, CGEventRef event) {
   }
 
   PalInputEvent input = {};
-  if (type == kCGEventKeyDown || type == kCGEventKeyUp) {
+  if (type == kCGEventKeyDown || type == kCGEventKeyUp || type == kCGEventFlagsChanged) {
+    CGEventFlags flags = CGEventGetFlags(event);
     input.event_type = PAL_INPUT_EVENT_KEYBOARD;
-    input.status = type == kCGEventKeyDown
-        ? PAL_INPUT_STATUS_PRESSED
-        : PAL_INPUT_STATUS_RELEASED;
+    input.status = type == kCGEventKeyUp
+        ? PAL_INPUT_STATUS_RELEASED
+        : PAL_INPUT_STATUS_PRESSED;
     input.key_code = (uint32_t)CGEventGetIntegerValueField(
         event,
         kCGKeyboardEventKeycode);
-    copy_cg_event_text(&input, event);
+    input.modifier_flags = pal_modifier_flags_from_cg(flags);
+    if (type == kCGEventFlagsChanged && (flags & kCGEventFlagMaskShift) == 0) {
+      input.status = PAL_INPUT_STATUS_RELEASED;
+    }
+    if (type != kCGEventFlagsChanged) {
+      copy_cg_event_text(&input, event);
+    }
+    copy_current_input_source_fingerprint(&input);
 
     if (PAL_LOG_EVENTS) {
       fprintf(stderr,
-              "[rime-poc native] cgevent key type=%u status=%d key=%u chars=%s len=%lu\n",
+              "[rime-poc native] cgevent key type=%u status=%d key=%u modifiers=%u chars=%s len=%lu source=%s\n",
               type,
               input.status,
               input.key_code,
+              input.modifier_flags,
               input.buffer_len > 0 ? input.buffer : "<empty>",
-              (unsigned long)input.buffer_len);
+              (unsigned long)input.buffer_len,
+              input.source_buffer_len > 0 ? input.source_buffer : "<unknown>");
       fflush(stderr);
     }
 
@@ -170,9 +311,13 @@ static void dispatch_cg_event(CGEventType type, CGEventRef event) {
   input.event_type = PAL_INPUT_EVENT_MOUSE;
   input.status = PAL_INPUT_STATUS_PRESSED;
   input.key_code = 0;
+  copy_current_input_source_fingerprint(&input);
 
   if (PAL_LOG_EVENTS) {
-    fprintf(stderr, "[rime-poc native] cgevent mouse type=%u\n", type);
+    fprintf(stderr,
+            "[rime-poc native] cgevent mouse type=%u source=%s\n",
+            type,
+            input.source_buffer_len > 0 ? input.source_buffer : "<unknown>");
     fflush(stderr);
   }
 
@@ -214,9 +359,28 @@ extern "C" void pal_pinyin_start_event_loop(PalEventCallback callback) {
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
 
+    PAL_WORKSPACE_OBSERVER = [[[NSWorkspace sharedWorkspace] notificationCenter]
+        addObserverForName:NSWorkspaceDidActivateApplicationNotification
+                    object:nil
+                     queue:[NSOperationQueue mainQueue]
+                usingBlock:^(NSNotification *notification) {
+                  (void)notification;
+                  dispatch_context_event("active_application_changed");
+                }];
+
+    PAL_INPUT_SOURCE_OBSERVER = [[NSNotificationCenter defaultCenter]
+        addObserverForName:NSTextInputContextKeyboardSelectionDidChangeNotification
+                    object:nil
+                     queue:[NSOperationQueue mainQueue]
+                usingBlock:^(NSNotification *notification) {
+                  (void)notification;
+                  dispatch_context_event("keyboard_selection_changed");
+                }];
+
     CGEventMask tap_mask =
         CGEventMaskBit(kCGEventKeyDown) |
         CGEventMaskBit(kCGEventKeyUp) |
+        CGEventMaskBit(kCGEventFlagsChanged) |
         CGEventMaskBit(kCGEventLeftMouseDown) |
         CGEventMaskBit(kCGEventRightMouseDown) |
         CGEventMaskBit(kCGEventOtherMouseDown);
@@ -250,6 +414,7 @@ extern "C" void pal_pinyin_start_event_loop(PalEventCallback callback) {
 
     NSEventMask mask = NSEventMaskKeyDown |
                        NSEventMaskKeyUp |
+                       NSEventMaskFlagsChanged |
                        NSEventMaskLeftMouseDown |
                        NSEventMaskRightMouseDown |
                        NSEventMaskOtherMouseDown;
@@ -268,31 +433,43 @@ extern "C" void pal_pinyin_start_event_loop(PalEventCallback callback) {
         }
 
         PalInputEvent input = {};
-        if (event.type == NSEventTypeKeyDown || event.type == NSEventTypeKeyUp) {
+        if (event.type == NSEventTypeKeyDown ||
+            event.type == NSEventTypeKeyUp ||
+            event.type == NSEventTypeFlagsChanged) {
           input.event_type = PAL_INPUT_EVENT_KEYBOARD;
-          input.status = event.type == NSEventTypeKeyDown
-              ? PAL_INPUT_STATUS_PRESSED
-              : PAL_INPUT_STATUS_RELEASED;
+          input.status = event.type == NSEventTypeKeyUp
+              ? PAL_INPUT_STATUS_RELEASED
+              : PAL_INPUT_STATUS_PRESSED;
           input.key_code = event.keyCode;
+          input.modifier_flags = pal_modifier_flags_from_ns(event.modifierFlags);
+          if (event.type == NSEventTypeFlagsChanged &&
+              (event.modifierFlags & NSEventModifierFlagShift) == 0) {
+            input.status = PAL_INPUT_STATUS_RELEASED;
+          }
+          copy_current_input_source_fingerprint(&input);
 
-          NSString *characters = event.characters;
-          if (characters != nil) {
-            const char *chars = [characters UTF8String];
-            if (chars != nullptr) {
-              strncpy(input.buffer, chars, sizeof(input.buffer) - 1);
-              input.buffer[sizeof(input.buffer) - 1] = '\0';
-              input.buffer_len = strlen(input.buffer);
+          if (event.type != NSEventTypeFlagsChanged) {
+            NSString *characters = event.characters;
+            if (characters != nil) {
+              const char *chars = [characters UTF8String];
+              if (chars != nullptr) {
+                strncpy(input.buffer, chars, sizeof(input.buffer) - 1);
+                input.buffer[sizeof(input.buffer) - 1] = '\0';
+                input.buffer_len = strlen(input.buffer);
+              }
             }
           }
 
           if (PAL_LOG_EVENTS) {
             fprintf(stderr,
-                    "[rime-poc native] key event type=%ld status=%d key=%u chars=%s len=%lu\n",
+                    "[rime-poc native] key event type=%ld status=%d key=%u modifiers=%u chars=%s len=%lu source=%s\n",
                     (long)event.type,
                     input.status,
                     input.key_code,
+                    input.modifier_flags,
                     input.buffer_len > 0 ? input.buffer : "<empty>",
-                    (unsigned long)input.buffer_len);
+                    (unsigned long)input.buffer_len,
+                    input.source_buffer_len > 0 ? input.source_buffer : "<unknown>");
             fflush(stderr);
           }
 
@@ -303,8 +480,12 @@ extern "C" void pal_pinyin_start_event_loop(PalEventCallback callback) {
         input.event_type = PAL_INPUT_EVENT_MOUSE;
         input.status = PAL_INPUT_STATUS_PRESSED;
         input.key_code = 0;
+        copy_current_input_source_fingerprint(&input);
         if (PAL_LOG_EVENTS) {
-          fprintf(stderr, "[rime-poc native] mouse event type=%ld\n", (long)event.type);
+          fprintf(stderr,
+                  "[rime-poc native] mouse event type=%ld source=%s\n",
+                  (long)event.type,
+                  input.source_buffer_len > 0 ? input.source_buffer : "<unknown>");
           fflush(stderr);
         }
         PAL_CALLBACK(input);

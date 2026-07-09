@@ -45,6 +45,8 @@ static PalEventCallback PAL_CALLBACK = nullptr;
 static id PAL_MONITOR = nil;
 static id PAL_WORKSPACE_OBSERVER = nil;
 static id PAL_INPUT_SOURCE_OBSERVER = nil;
+static NSPanel *PAL_CANDIDATE_PANEL = nil;
+static NSView *PAL_CANDIDATE_CONTENT = nil;
 static CFMachPortRef PAL_EVENT_TAP = nullptr;
 static CFRunLoopSourceRef PAL_EVENT_TAP_SOURCE = nullptr;
 static bool PAL_LOG_EVENTS = false;
@@ -343,6 +345,528 @@ static CGEventRef event_tap_callback(
 
   dispatch_cg_event(type, event);
   return event;
+}
+
+static NSTextField *pal_make_label(NSString *text, NSFont *font, NSColor *color) {
+  NSTextField *label = [NSTextField labelWithString:text != nil ? text : @""];
+  label.font = font;
+  label.textColor = color;
+  label.lineBreakMode = NSLineBreakByTruncatingTail;
+  label.maximumNumberOfLines = 1;
+  label.translatesAutoresizingMaskIntoConstraints = YES;
+  [label sizeToFit];
+  return label;
+}
+
+static NSArray<NSString *> *pal_split_candidates(NSString *candidates) {
+  if (candidates == nil || candidates.length == 0) {
+    return @[];
+  }
+
+  NSArray<NSString *> *parts = [candidates componentsSeparatedByString:@"\n"];
+  NSMutableArray<NSString *> *result = [NSMutableArray arrayWithCapacity:parts.count];
+  for (NSString *part in parts) {
+    if (part.length > 0) {
+      [result addObject:part];
+    }
+  }
+  return result;
+}
+
+static NSScreen *pal_screen_for_point(NSPoint point) {
+  for (NSScreen *screen in [NSScreen screens]) {
+    if (NSPointInRect(point, screen.visibleFrame)) {
+      return screen;
+    }
+  }
+  return [NSScreen mainScreen];
+}
+
+typedef enum {
+  PAL_CANDIDATE_ANCHOR_CARET = 0,
+  PAL_CANDIDATE_ANCHOR_FOCUSED_ELEMENT = 1,
+  PAL_CANDIDATE_ANCHOR_MOUSE = 2,
+} PalCandidateAnchorKind;
+
+typedef struct {
+  NSPoint point;
+  PalCandidateAnchorKind kind;
+} PalCandidateAnchor;
+
+static bool pal_ax_rect_is_usable(CGRect rect) {
+  return isfinite(rect.origin.x) &&
+      isfinite(rect.origin.y) &&
+      isfinite(rect.size.width) &&
+      isfinite(rect.size.height) &&
+      rect.size.width >= 0.0 &&
+      rect.size.height > 0.0;
+}
+
+static CGFloat pal_global_max_screen_y() {
+  CGFloat max_y = 0.0;
+  BOOL has_screen = NO;
+  for (NSScreen *screen in [NSScreen screens]) {
+    max_y = has_screen ? MAX(max_y, NSMaxY(screen.frame)) : NSMaxY(screen.frame);
+    has_screen = YES;
+  }
+  return has_screen ? max_y : 0.0;
+}
+
+static NSRect pal_appkit_rect_from_ax_rect(CGRect ax_rect) {
+  CGFloat global_max_y = pal_global_max_screen_y();
+  return NSMakeRect(
+      ax_rect.origin.x,
+      global_max_y - ax_rect.origin.y - ax_rect.size.height,
+      ax_rect.size.width,
+      ax_rect.size.height);
+}
+
+static bool pal_rect_looks_like_text_target(NSRect rect) {
+  if (rect.size.width <= 0.0 || rect.size.height <= 0.0) {
+    return false;
+  }
+
+  NSScreen *screen = pal_screen_for_point(NSMakePoint(NSMidX(rect), NSMidY(rect)));
+  NSRect visible = screen != nil ? screen.visibleFrame : NSMakeRect(0, 0, 800, 600);
+  if (rect.size.height > 180.0) {
+    return false;
+  }
+  if (rect.size.width > visible.size.width * 0.95 &&
+      rect.size.height > visible.size.height * 0.35) {
+    return false;
+  }
+  return true;
+}
+
+static AXUIElementRef pal_copy_focused_element() {
+  if (!AXIsProcessTrusted()) {
+    return nullptr;
+  }
+
+  AXUIElementRef system = AXUIElementCreateSystemWide();
+  if (system == nullptr) {
+    return nullptr;
+  }
+
+  CFTypeRef focused_ref = nullptr;
+  AXError error = AXUIElementCopyAttributeValue(
+      system,
+      kAXFocusedUIElementAttribute,
+      &focused_ref);
+  CFRelease(system);
+
+  if (error != kAXErrorSuccess || focused_ref == nullptr) {
+    return nullptr;
+  }
+  if (CFGetTypeID(focused_ref) != AXUIElementGetTypeID()) {
+    CFRelease(focused_ref);
+    return nullptr;
+  }
+  return (AXUIElementRef)focused_ref;
+}
+
+static bool pal_copy_ax_position_and_size(AXUIElementRef element, CGRect *rect) {
+  if (element == nullptr || rect == nullptr) {
+    return false;
+  }
+
+  CFTypeRef position_ref = nullptr;
+  CFTypeRef size_ref = nullptr;
+  CGPoint position = CGPointZero;
+  CGSize size = CGSizeZero;
+  bool ok = false;
+
+  AXError position_error = AXUIElementCopyAttributeValue(
+      element,
+      kAXPositionAttribute,
+      &position_ref);
+  AXError size_error = AXUIElementCopyAttributeValue(
+      element,
+      kAXSizeAttribute,
+      &size_ref);
+
+  if (position_error == kAXErrorSuccess &&
+      size_error == kAXErrorSuccess &&
+      position_ref != nullptr &&
+      size_ref != nullptr &&
+      CFGetTypeID(position_ref) == AXValueGetTypeID() &&
+      CFGetTypeID(size_ref) == AXValueGetTypeID() &&
+      AXValueGetType((AXValueRef)position_ref) == kAXValueCGPointType &&
+      AXValueGetType((AXValueRef)size_ref) == kAXValueCGSizeType &&
+      AXValueGetValue(
+          (AXValueRef)position_ref,
+          (AXValueType)kAXValueCGPointType,
+          &position) &&
+      AXValueGetValue(
+          (AXValueRef)size_ref,
+          (AXValueType)kAXValueCGSizeType,
+          &size)) {
+    CGRect candidate = CGRectMake(position.x, position.y, size.width, size.height);
+    if (pal_ax_rect_is_usable(candidate)) {
+      *rect = candidate;
+      ok = true;
+    }
+  }
+
+  if (position_ref != nullptr) {
+    CFRelease(position_ref);
+  }
+  if (size_ref != nullptr) {
+    CFRelease(size_ref);
+  }
+  return ok;
+}
+
+static bool pal_copy_parameterized_rect(
+    AXUIElementRef element,
+    CFStringRef attribute,
+    CFTypeRef parameter,
+    CGRect *rect) {
+  if (element == nullptr || attribute == nullptr || parameter == nullptr || rect == nullptr) {
+    return false;
+  }
+
+  CFTypeRef bounds_ref = nullptr;
+  bool ok = false;
+
+  AXError bounds_error = AXUIElementCopyParameterizedAttributeValue(
+      element,
+      attribute,
+      parameter,
+      &bounds_ref);
+  if (bounds_error == kAXErrorSuccess &&
+      bounds_ref != nullptr &&
+      CFGetTypeID(bounds_ref) == AXValueGetTypeID() &&
+      AXValueGetType((AXValueRef)bounds_ref) == kAXValueCGRectType) {
+    CGRect bounds = CGRectZero;
+    if (AXValueGetValue(
+            (AXValueRef)bounds_ref,
+            (AXValueType)kAXValueCGRectType,
+            &bounds) &&
+        pal_ax_rect_is_usable(bounds)) {
+      *rect = bounds;
+      ok = true;
+    }
+  }
+
+  if (bounds_ref != nullptr) {
+    CFRelease(bounds_ref);
+  }
+  return ok;
+}
+
+static bool pal_copy_selected_text_range_bounds(AXUIElementRef focused, CGRect *rect) {
+  CFTypeRef selected_range_ref = nullptr;
+  bool ok = false;
+
+  AXError range_error = AXUIElementCopyAttributeValue(
+      focused,
+      kAXSelectedTextRangeAttribute,
+      &selected_range_ref);
+  if (range_error == kAXErrorSuccess &&
+      selected_range_ref != nullptr &&
+      CFGetTypeID(selected_range_ref) == AXValueGetTypeID() &&
+      AXValueGetType((AXValueRef)selected_range_ref) == kAXValueCFRangeType) {
+    ok = pal_copy_parameterized_rect(
+        focused,
+        kAXBoundsForRangeParameterizedAttribute,
+        selected_range_ref,
+        rect);
+  }
+
+  if (selected_range_ref != nullptr) {
+    CFRelease(selected_range_ref);
+  }
+  return ok;
+}
+
+static bool pal_copy_selected_text_marker_bounds(AXUIElementRef focused, CGRect *rect) {
+  CFTypeRef marker_range_ref = nullptr;
+  bool ok = false;
+
+  AXError marker_error = AXUIElementCopyAttributeValue(
+      focused,
+      CFSTR("AXSelectedTextMarkerRange"),
+      &marker_range_ref);
+  if (marker_error == kAXErrorSuccess && marker_range_ref != nullptr) {
+    ok = pal_copy_parameterized_rect(
+        focused,
+        CFSTR("AXBoundsForTextMarkerRange"),
+        marker_range_ref,
+        rect);
+  }
+
+  if (marker_range_ref != nullptr) {
+    CFRelease(marker_range_ref);
+  }
+  return ok;
+}
+
+static bool pal_copy_caret_bounds(CGRect *rect) {
+  AXUIElementRef focused = pal_copy_focused_element();
+  if (focused == nullptr) {
+    return false;
+  }
+
+  bool ok = pal_copy_selected_text_range_bounds(focused, rect) ||
+      pal_copy_selected_text_marker_bounds(focused, rect);
+  CFRelease(focused);
+  return ok;
+}
+
+static bool pal_copy_focused_element_bounds(CGRect *rect) {
+  AXUIElementRef focused = pal_copy_focused_element();
+  if (focused == nullptr) {
+    return false;
+  }
+
+  bool ok = pal_copy_ax_position_and_size(focused, rect);
+  CFRelease(focused);
+  return ok;
+}
+
+static PalCandidateAnchor pal_candidate_anchor() {
+  CGRect ax_rect = CGRectZero;
+
+  if (pal_copy_caret_bounds(&ax_rect)) {
+    NSRect rect = pal_appkit_rect_from_ax_rect(ax_rect);
+    return { NSMakePoint(NSMinX(rect), NSMinY(rect)), PAL_CANDIDATE_ANCHOR_CARET };
+  }
+
+  if (pal_copy_focused_element_bounds(&ax_rect)) {
+    NSRect rect = pal_appkit_rect_from_ax_rect(ax_rect);
+    if (pal_rect_looks_like_text_target(rect)) {
+      return {
+        NSMakePoint(NSMinX(rect) + 10.0, NSMinY(rect)),
+        PAL_CANDIDATE_ANCHOR_FOCUSED_ELEMENT
+      };
+    }
+  }
+
+  return { [NSEvent mouseLocation], PAL_CANDIDATE_ANCHOR_MOUSE };
+}
+
+static NSRect pal_candidate_panel_frame(NSSize size, PalCandidateAnchor anchor) {
+  NSScreen *screen = pal_screen_for_point(anchor.point);
+  NSRect visible = screen != nil ? screen.visibleFrame : NSMakeRect(0, 0, 800, 600);
+  CGFloat margin = 12.0;
+  CGFloat horizontal_offset = anchor.kind == PAL_CANDIDATE_ANCHOR_MOUSE ? 18.0 : 0.0;
+  CGFloat vertical_offset = anchor.kind == PAL_CANDIDATE_ANCHOR_MOUSE ? 18.0 : 8.0;
+  CGFloat x = anchor.point.x + horizontal_offset;
+  CGFloat y = anchor.point.y - size.height - vertical_offset;
+
+  if (x + size.width > NSMaxX(visible) - margin) {
+    x = NSMaxX(visible) - size.width - margin;
+  }
+  if (x < NSMinX(visible) + margin) {
+    x = NSMinX(visible) + margin;
+  }
+
+  if (y < NSMinY(visible) + margin) {
+    y = anchor.point.y + vertical_offset;
+  }
+  if (y + size.height > NSMaxY(visible) - margin) {
+    y = NSMaxY(visible) - size.height - margin;
+  }
+  if (y < NSMinY(visible) + margin) {
+    y = NSMinY(visible) + margin;
+  }
+
+  return NSMakeRect(round(x), round(y), round(size.width), round(size.height));
+}
+
+static void pal_ensure_candidate_panel() {
+  if (PAL_CANDIDATE_PANEL != nil) {
+    return;
+  }
+
+  NSRect initial_frame = NSMakeRect(0, 0, 260, 74);
+  PAL_CANDIDATE_PANEL = [[NSPanel alloc]
+      initWithContentRect:initial_frame
+                styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
+                  backing:NSBackingStoreBuffered
+                    defer:NO];
+  PAL_CANDIDATE_PANEL.releasedWhenClosed = NO;
+  PAL_CANDIDATE_PANEL.opaque = NO;
+  PAL_CANDIDATE_PANEL.backgroundColor = [NSColor clearColor];
+  PAL_CANDIDATE_PANEL.hasShadow = YES;
+  PAL_CANDIDATE_PANEL.hidesOnDeactivate = NO;
+  PAL_CANDIDATE_PANEL.ignoresMouseEvents = YES;
+  PAL_CANDIDATE_PANEL.level = NSPopUpMenuWindowLevel;
+  PAL_CANDIDATE_PANEL.collectionBehavior =
+      NSWindowCollectionBehaviorCanJoinAllSpaces |
+      NSWindowCollectionBehaviorFullScreenAuxiliary |
+      NSWindowCollectionBehaviorTransient;
+
+  PAL_CANDIDATE_CONTENT = [[NSView alloc] initWithFrame:initial_frame];
+  PAL_CANDIDATE_CONTENT.wantsLayer = YES;
+  PAL_CANDIDATE_CONTENT.layer.cornerRadius = 8.0;
+  PAL_CANDIDATE_CONTENT.layer.masksToBounds = YES;
+  PAL_CANDIDATE_CONTENT.layer.borderWidth = 1.0;
+  PAL_CANDIDATE_CONTENT.layer.borderColor =
+      [[NSColor separatorColor] colorWithAlphaComponent:0.55].CGColor;
+  PAL_CANDIDATE_CONTENT.layer.backgroundColor =
+      [[NSColor windowBackgroundColor] colorWithAlphaComponent:0.96].CGColor;
+  PAL_CANDIDATE_PANEL.contentView = PAL_CANDIDATE_CONTENT;
+}
+
+static void pal_render_candidate_panel(
+    NSString *preedit,
+    NSArray<NSString *> *candidates,
+    int32_t layout) {
+  pal_ensure_candidate_panel();
+
+  NSArray *subviews = [PAL_CANDIDATE_CONTENT.subviews copy];
+  for (NSView *subview in subviews) {
+    [subview removeFromSuperview];
+  }
+  [subviews release];
+
+  CGFloat padding = 12.0;
+  CGFloat row_gap = 7.0;
+  CGFloat item_gap = 10.0;
+  CGFloat min_width = 220.0;
+  CGFloat item_height = 22.0;
+  PalCandidateAnchor anchor = pal_candidate_anchor();
+  NSScreen *screen = pal_screen_for_point(anchor.point);
+  CGFloat max_width = (screen != nil ? screen.visibleFrame.size.width : 800.0) - 40.0;
+  if (max_width < min_width) {
+    max_width = min_width;
+  }
+
+  NSString *preedit_text = preedit.length > 0 ? preedit : @"Rime active";
+  NSTextField *preedit_label = pal_make_label(
+      preedit_text,
+      [NSFont monospacedSystemFontOfSize:13.0 weight:NSFontWeightSemibold],
+      [NSColor labelColor]);
+  CGFloat content_max_width = max_width - padding * 2.0;
+  NSSize preedit_size = preedit_label.fittingSize;
+  CGFloat preedit_width = MIN(MAX(preedit_size.width, 80.0), content_max_width);
+
+  NSMutableArray<NSTextField *> *candidate_labels = [NSMutableArray array];
+  NSUInteger index = 1;
+  for (NSString *candidate in candidates) {
+    NSString *display = [NSString stringWithFormat:@"%lu. %@", (unsigned long)index, candidate];
+    NSTextField *label = pal_make_label(
+        display,
+        [NSFont systemFontOfSize:14.0 weight:NSFontWeightRegular],
+        [NSColor labelColor]);
+    [candidate_labels addObject:label];
+    index += 1;
+  }
+
+  if (candidate_labels.count == 0) {
+    NSTextField *label = pal_make_label(
+        @"Listening",
+        [NSFont systemFontOfSize:13.0 weight:NSFontWeightRegular],
+        [NSColor secondaryLabelColor]);
+    [candidate_labels addObject:label];
+  }
+
+  BOOL vertical = layout == 1;
+  CGFloat panel_width = min_width;
+  CGFloat panel_height = 0.0;
+  NSMutableArray<NSNumber *> *item_widths = [NSMutableArray arrayWithCapacity:candidate_labels.count];
+
+  if (vertical) {
+    CGFloat widest = preedit_width;
+    for (NSTextField *label in candidate_labels) {
+      CGFloat width = MIN(MAX(label.fittingSize.width, 90.0), content_max_width);
+      [item_widths addObject:@(width)];
+      widest = MAX(widest, width);
+    }
+    panel_width = MIN(MAX(widest + padding * 2.0, min_width), max_width);
+    panel_height = padding + preedit_label.fittingSize.height + row_gap +
+        candidate_labels.count * item_height +
+        (candidate_labels.count - 1) * 3.0 + padding;
+  } else {
+    CGFloat row_width = 0.0;
+    for (NSTextField *label in candidate_labels) {
+      CGFloat width = MIN(MAX(label.fittingSize.width, 54.0), 180.0);
+      [item_widths addObject:@(width)];
+      row_width += width;
+    }
+    row_width += item_gap * (candidate_labels.count - 1);
+    if (row_width > content_max_width && candidate_labels.count > 0) {
+      [item_widths removeAllObjects];
+      CGFloat equal_width =
+          floor((content_max_width - item_gap * (candidate_labels.count - 1)) /
+                candidate_labels.count);
+      row_width = 0.0;
+      for (NSUInteger i = 0; i < candidate_labels.count; i++) {
+        CGFloat width = MAX(equal_width, 1.0);
+        [item_widths addObject:@(width)];
+        row_width += width;
+      }
+      row_width += item_gap * (candidate_labels.count - 1);
+    }
+    panel_width = MIN(MAX(MAX(preedit_width, row_width) + padding * 2.0, min_width), max_width);
+    panel_height = padding + preedit_label.fittingSize.height + row_gap + item_height + padding;
+  }
+
+  NSSize panel_size = NSMakeSize(panel_width, panel_height);
+  [PAL_CANDIDATE_PANEL setFrame:pal_candidate_panel_frame(panel_size, anchor) display:NO];
+  PAL_CANDIDATE_CONTENT.frame = NSMakeRect(0, 0, panel_width, panel_height);
+
+  CGFloat y = panel_height - padding - preedit_label.fittingSize.height;
+  preedit_label.frame = NSMakeRect(
+      padding,
+      y,
+      panel_width - padding * 2.0,
+      preedit_label.fittingSize.height);
+  [PAL_CANDIDATE_CONTENT addSubview:preedit_label];
+
+  y -= row_gap + item_height;
+  CGFloat x = padding;
+  for (NSUInteger i = 0; i < candidate_labels.count; i++) {
+    NSTextField *label = candidate_labels[i];
+    CGFloat width = item_widths[i].doubleValue;
+    if (vertical) {
+      label.frame = NSMakeRect(padding, y, panel_width - padding * 2.0, item_height);
+      y -= item_height + 3.0;
+    } else {
+      label.frame = NSMakeRect(x, y, width, item_height);
+      x += width + item_gap;
+    }
+    [PAL_CANDIDATE_CONTENT addSubview:label];
+  }
+
+  [PAL_CANDIDATE_PANEL orderFrontRegardless];
+}
+
+extern "C" void pal_pinyin_update_candidate_panel(
+    const char *preedit,
+    const char *candidates,
+    int32_t layout) {
+  char *preedit_copy = strdup(preedit != nullptr ? preedit : "");
+  char *candidates_copy = strdup(candidates != nullptr ? candidates : "");
+
+  dispatch_async(dispatch_get_main_queue(), ^{
+    @autoreleasepool {
+      NSString *preedit_string = [NSString stringWithUTF8String:preedit_copy];
+      NSString *candidates_string = [NSString stringWithUTF8String:candidates_copy];
+      free(preedit_copy);
+      free(candidates_copy);
+
+      if (preedit_string == nil) {
+        preedit_string = @"";
+      }
+      if (candidates_string == nil) {
+        candidates_string = @"";
+      }
+      pal_render_candidate_panel(preedit_string, pal_split_candidates(candidates_string), layout);
+    }
+  });
+}
+
+extern "C" void pal_pinyin_hide_candidate_panel() {
+  dispatch_async(dispatch_get_main_queue(), ^{
+    @autoreleasepool {
+      if (PAL_CANDIDATE_PANEL != nil) {
+        [PAL_CANDIDATE_PANEL orderOut:nil];
+      }
+    }
+  });
 }
 
 extern "C" void pal_pinyin_start_event_loop(PalEventCallback callback) {

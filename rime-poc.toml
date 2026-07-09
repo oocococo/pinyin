@@ -13,3 +13,8 @@ trigger_suffix = "''"
 #   Rime decide commits/candidates, including any mixed Chinese/English behavior
 #   provided by the active schema.
 conversion_mode = "segmented"
+
+# Candidate UI shown while the listener is in an active session.
+# Layout values: "horizontal" or "vertical".
+candidate_layout = "horizontal"
+candidate_count = 5

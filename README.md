@@ -56,11 +56,16 @@ current directory, or from `--config <FILE>` / `RIME_POC_CONFIG`:
 ```toml
 trigger_prefix = ";;"
 trigger_suffix = ";;"
+candidate_layout = "horizontal"
+candidate_count = 5
 ```
 
 Trigger strings cannot contain punctuation that is reserved for separating
 pinyin runs inside the body: comma, period, question mark, exclamation mark, minus, plus,
 ellipsis, tilde, or double quote, including common Chinese/full-width variants.
+The listener candidate UI supports `candidate_layout = "horizontal"` or
+`"vertical"` and shows `candidate_count` candidates from 1 to 20. The default
+is a horizontal list with 5 candidates.
 
 ## Usage
 
@@ -133,15 +138,23 @@ The configured trigger is reserved for state changes: with the default config,
 `;` are not treated as incremental separators, avoiding ambiguity between a
 single trigger character and the full trigger. Each opening trigger starts an
 isolated session; text before that trigger is not part of the active capture
-buffer. Mouse context changes, active application changes, input source changes,
-and Command-Tab/Command-Backtick window switch shortcuts clear the active
-session. The listener also records the macOS input source fingerprint when a
-session opens and verifies it on later key events; if the input route changes
-before conversion, it abandons the internal session without deleting or
-injecting text. Only macOS system input sources with `source=com.apple...` are
-allowed to open or continue a session; third-party input methods are ignored
-even if they are in an English/direct-input mode. Pressing Shift by itself
-aborts the active session, which covers IME Chinese/English toggles.
+buffer. When the opening trigger is detected, the listener deletes those trigger
+characters and shows a non-activating macOS candidate panel as the active-state
+indicator. As pinyin is typed, the panel shows the current Rime preedit and the
+configured number of candidates. Candidate selection is not handled yet; the UI
+is display-only. The panel is positioned from the macOS Accessibility caret
+bounds when available, including browser text-marker ranges, then falls back to
+focused text-field bounds and finally the mouse anchor. Mouse context changes,
+active application changes, input source
+changes, and Command-Tab/Command-Backtick window switch shortcuts clear the
+active session and hide the panel. The listener also records the macOS input
+source fingerprint when a session opens and verifies it on later key events; if
+the input route changes before conversion, it abandons the internal session
+without deleting or injecting text. Only macOS system input sources with
+`source=com.apple...` are allowed to open or continue a session; third-party
+input methods are ignored even if they are in an English/direct-input mode.
+Pressing Shift by itself aborts the active session, which covers IME
+Chinese/English toggles.
 Command-C,
 Control-C, and common Command editing shortcuts abort the session; Control-W
 keeps the session active and removes the previous raw pinyin word from the
@@ -157,7 +170,7 @@ For example:
 leaves the visible text as:
 
 ```text
-我要测试;;
+我要测试
 ```
 
 Continuing from that state, typing:
@@ -169,10 +182,10 @@ zhongwenshurufa<Space>
 leaves:
 
 ```text
-我要测试中文输入法;;
+我要测试中文输入法
 ```
 
-Typing the closing trigger then removes only the current marker and suffix:
+Typing the closing trigger then removes only the suffix and hides the panel:
 
 ```text
 我要测试中文输入法
@@ -182,6 +195,7 @@ Useful listener flags:
 
 ```sh
 bash scripts/run-listener.sh --max-buffer-chars 4096 --inject-delay-ms 1
+bash scripts/run-listener.sh --candidate-layout vertical --candidate-count 8
 bash scripts/run-listener.sh --log-events
 ```
 

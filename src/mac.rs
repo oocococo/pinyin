@@ -5,6 +5,8 @@ use std::{
 
 use anyhow::Result;
 
+use super::CandidateLayout;
+
 pub const EVENT_KEYBOARD: i32 = 1;
 pub const EVENT_MOUSE: i32 = 2;
 pub const EVENT_CONTEXT: i32 = 3;
@@ -103,6 +105,25 @@ pub fn inject_string(text: &str, delay_ms: i32) -> Result<()> {
     Ok(())
 }
 
+pub fn update_candidate_panel(
+    preedit: &str,
+    candidates: &[String],
+    layout: CandidateLayout,
+) -> Result<()> {
+    let preedit = CString::new(preedit)?;
+    let candidates = CString::new(candidates.join("\n"))?;
+    let layout = match layout {
+        CandidateLayout::Horizontal => 0,
+        CandidateLayout::Vertical => 1,
+    };
+    unsafe { pal_pinyin_update_candidate_panel(preedit.as_ptr(), candidates.as_ptr(), layout) };
+    Ok(())
+}
+
+pub fn hide_candidate_panel() {
+    unsafe { pal_pinyin_hide_candidate_panel() };
+}
+
 pub fn start_event_loop(callback: extern "C" fn(InputEvent)) -> ! {
     unsafe { pal_pinyin_start_event_loop(callback) };
     unreachable!("macOS event loop returned unexpectedly")
@@ -115,4 +136,10 @@ unsafe extern "C" {
     fn pal_pinyin_start_event_loop(callback: extern "C" fn(InputEvent));
     fn pal_pinyin_inject_backspaces(count: c_uint, delay_ms: c_int);
     fn pal_pinyin_inject_string(string: *const c_char, delay_ms: c_int);
+    fn pal_pinyin_update_candidate_panel(
+        preedit: *const c_char,
+        candidates: *const c_char,
+        layout: c_int,
+    );
+    fn pal_pinyin_hide_candidate_panel();
 }

@@ -20,7 +20,10 @@ const DEFAULT_CONFIG_FILE: &str = "rime-poc.toml";
 const DEFAULT_TRIGGER: &str = ";;";
 const DEFAULT_MAX_BUFFER_CHARS: usize = 4096;
 const DEFAULT_INJECT_DELAY_MS: i32 = 1;
+const DEFAULT_CANDIDATE_COUNT: usize = 5;
 const MIN_MAX_BUFFER_CHARS: usize = 16;
+const MIN_CANDIDATE_COUNT: usize = 1;
+const MAX_CANDIDATE_COUNT: usize = 20;
 
 #[cfg(target_os = "macos")]
 static LISTENER_RUNTIME: OnceLock<Mutex<ListenerRuntime>> = OnceLock::new();
@@ -46,6 +49,8 @@ struct AppConfig {
     trigger_prefix: String,
     trigger_suffix: String,
     conversion_mode: ConversionMode,
+    candidate_layout: CandidateLayout,
+    candidate_count: usize,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -53,6 +58,8 @@ struct FileConfig {
     trigger_prefix: Option<String>,
     trigger_suffix: Option<String>,
     conversion_mode: Option<String>,
+    candidate_layout: Option<String>,
+    candidate_count: Option<usize>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -68,12 +75,24 @@ enum ConversionMode {
     RimeAuto,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateLayout {
+    Horizontal,
+    Vertical,
+}
+
 #[derive(Debug)]
 struct ConvertedSegment {
     raw: String,
     normalized: String,
     preedit: String,
     first: String,
+}
+
+#[derive(Debug)]
+struct CandidatePreview {
+    preedit: String,
+    candidates: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -86,8 +105,15 @@ struct ConversionOutput {
 
 #[derive(Debug, PartialEq, Eq)]
 enum CaptureAction {
+    StartSession(StartSessionAction),
     Convert(ConversionAction),
     EndSession(EndSessionAction),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct StartSessionAction {
+    trigger_text: String,
+    delete_chars: usize,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -219,6 +245,14 @@ impl Options {
             .ok()
             .map(|value| ConversionMode::parse(&value))
             .transpose()?;
+        let mut candidate_layout_override = env::var("RIME_POC_CANDIDATE_LAYOUT")
+            .ok()
+            .map(|value| CandidateLayout::parse(&value))
+            .transpose()?;
+        let mut candidate_count_override = env::var("RIME_POC_CANDIDATE_COUNT")
+            .ok()
+            .map(|value| parse_usize(&value, "RIME_POC_CANDIDATE_COUNT"))
+            .transpose()?;
         let mut max_buffer_chars = env::var("RIME_POC_MAX_BUFFER_CHARS")
             .ok()
             .map(|value| parse_usize(&value, "RIME_POC_MAX_BUFFER_CHARS"))
@@ -252,6 +286,18 @@ impl Options {
                         "--conversion-mode",
                     )?)?);
                 }
+                "--candidate-layout" => {
+                    candidate_layout_override = Some(CandidateLayout::parse(&next_arg(
+                        &mut args,
+                        "--candidate-layout",
+                    )?)?);
+                }
+                "--candidate-count" => {
+                    candidate_count_override = Some(parse_usize(
+                        &next_arg(&mut args, "--candidate-count")?,
+                        "--candidate-count",
+                    )?);
+                }
                 "--listen" => listen = true,
                 "--log-events" => log_events = true,
                 "--max-buffer-chars" => {
@@ -281,8 +327,14 @@ impl Options {
         if let Some(conversion_mode) = conversion_mode_override {
             config.conversion_mode = conversion_mode;
         }
+        if let Some(candidate_layout) = candidate_layout_override {
+            config.candidate_layout = candidate_layout;
+        }
+        if let Some(candidate_count) = candidate_count_override {
+            config.candidate_count = candidate_count;
+        }
         validate_config(&config)?;
-        validate_runtime_options(max_buffer_chars, inject_delay_ms)?;
+        validate_runtime_options(max_buffer_chars, inject_delay_ms, config.candidate_count)?;
 
         Ok(Self {
             shared_data_dir,
@@ -307,6 +359,8 @@ impl Default for AppConfig {
             trigger_prefix: DEFAULT_TRIGGER.to_owned(),
             trigger_suffix: DEFAULT_TRIGGER.to_owned(),
             conversion_mode: ConversionMode::Segmented,
+            candidate_layout: CandidateLayout::Horizontal,
+            candidate_count: DEFAULT_CANDIDATE_COUNT,
         }
     }
 }
@@ -326,6 +380,25 @@ impl ConversionMode {
         match self {
             Self::Segmented => "segmented",
             Self::RimeAuto => "rime-auto",
+        }
+    }
+}
+
+impl CandidateLayout {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "horizontal" | "h" => Ok(Self::Horizontal),
+            "vertical" | "v" => Ok(Self::Vertical),
+            _ => {
+                bail!("invalid candidate layout {value:?}; expected \"horizontal\" or \"vertical\"")
+            }
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Horizontal => "horizontal",
+            Self::Vertical => "vertical",
         }
     }
 }
@@ -366,6 +439,14 @@ fn load_config(config_path: Option<PathBuf>) -> Result<(AppConfig, Option<PathBu
                 .map(|value| ConversionMode::parse(&value))
                 .transpose()?
                 .unwrap_or(defaults.conversion_mode),
+            candidate_layout: file_config
+                .candidate_layout
+                .map(|value| CandidateLayout::parse(&value))
+                .transpose()?
+                .unwrap_or(defaults.candidate_layout),
+            candidate_count: file_config
+                .candidate_count
+                .unwrap_or(defaults.candidate_count),
         },
         Some(path),
     ))
@@ -382,13 +463,25 @@ fn validate_config(config: &AppConfig) -> Result<()> {
     Ok(())
 }
 
-fn validate_runtime_options(max_buffer_chars: usize, inject_delay_ms: i32) -> Result<()> {
+fn validate_runtime_options(
+    max_buffer_chars: usize,
+    inject_delay_ms: i32,
+    candidate_count: usize,
+) -> Result<()> {
     if max_buffer_chars < MIN_MAX_BUFFER_CHARS {
         bail!("max buffer chars must be at least {MIN_MAX_BUFFER_CHARS}");
     }
 
     if inject_delay_ms < 0 {
         bail!("inject delay must be greater than or equal to 0");
+    }
+
+    if candidate_count < MIN_CANDIDATE_COUNT {
+        bail!("candidate count must be at least {MIN_CANDIDATE_COUNT}");
+    }
+
+    if candidate_count > MAX_CANDIDATE_COUNT {
+        bail!("candidate count must be at most {MAX_CANDIDATE_COUNT}");
     }
 
     Ok(())
@@ -494,6 +587,11 @@ fn run_conversion(options: &Options, body: String) -> Result<()> {
         "conversion_mode: {}",
         options.config.conversion_mode.as_str()
     );
+    println!(
+        "candidate_layout: {}",
+        options.config.candidate_layout.as_str()
+    );
+    println!("candidate_count: {}", options.config.candidate_count);
     match &options.config_path {
         Some(path) => println!("config:          {}", path.display()),
         None => println!("config:          <defaults>"),
@@ -565,6 +663,14 @@ fn run_listener(options: Options) -> Result<()> {
     println!(
         "trigger_suffix:  {:?}",
         runtime.options.config.trigger_suffix
+    );
+    println!(
+        "candidate_layout: {}",
+        runtime.options.config.candidate_layout.as_str()
+    );
+    println!(
+        "candidate_count: {}",
+        runtime.options.config.candidate_count
     );
     println!("max_buffer_chars: {}", runtime.options.max_buffer_chars);
     println!("inject_delay_ms: {}", runtime.options.inject_delay_ms);
@@ -870,11 +976,17 @@ impl CaptureState {
         match self.mode {
             CaptureMode::Idle => {
                 if self.buffer.ends_with(&self.config.trigger_prefix) {
-                    self.buffer = self.config.trigger_prefix.clone();
+                    let trigger_text = self.config.trigger_prefix.clone();
+                    let delete_chars = trigger_text.chars().count();
+                    self.buffer.clear();
                     self.mode = CaptureMode::Active;
-                    self.prefix_visible = true;
+                    self.prefix_visible = false;
                     self.marker_chars_visible = 0;
                     self.last_conversion = None;
+                    return Some(CaptureAction::StartSession(StartSessionAction {
+                        trigger_text,
+                        delete_chars,
+                    }));
                 }
                 None
             }
@@ -897,12 +1009,8 @@ impl CaptureState {
         if self.buffer.pop().is_some() {
             if self.buffer.is_empty() {
                 self.prefix_visible = false;
-                if self.marker_chars_visible > 0 {
-                    self.mode = CaptureMode::Active;
-                } else {
-                    self.mode = CaptureMode::Idle;
-                    self.marker_chars_visible = 0;
-                }
+                self.mode = CaptureMode::Idle;
+                self.marker_chars_visible = 0;
             } else if self.prefix_visible && !self.buffer.starts_with(&self.config.trigger_prefix) {
                 self.marker_chars_visible = self.buffer.chars().count();
                 self.buffer.clear();
@@ -933,6 +1041,12 @@ impl CaptureState {
         while self.buffer.chars().last().is_some_and(is_pinyin_char) {
             self.buffer.pop();
         }
+
+        if self.mode == CaptureMode::Active && self.buffer.is_empty() {
+            self.mode = CaptureMode::Idle;
+            self.prefix_visible = false;
+            self.marker_chars_visible = 0;
+        }
     }
 
     fn clear(&mut self) {
@@ -958,15 +1072,18 @@ impl CaptureState {
 
     fn restore_last_conversion(&mut self) -> Option<RestoreAction> {
         let conversion = self.last_conversion.take()?;
-        let marker_text = self.config.trigger_prefix.clone();
-        let delete_remaining_chars =
-            conversion.inserted_text.chars().count() + self.marker_chars_visible.saturating_sub(1);
+        let inserted_chars = conversion.inserted_text.chars().count();
+        let delete_remaining_chars = if self.marker_chars_visible > 0 {
+            inserted_chars + self.marker_chars_visible.saturating_sub(1)
+        } else {
+            inserted_chars.saturating_sub(1)
+        };
 
         self.buffer = conversion.original_text.clone();
         self.mode = CaptureMode::Active;
         self.prefix_visible = false;
-        self.marker_chars_visible = self.config.trigger_prefix.chars().count();
-        let replacement_text = format!("{}{}", marker_text, conversion.original_text);
+        self.marker_chars_visible = 0;
+        let replacement_text = conversion.original_text.clone();
 
         Some(RestoreAction {
             original_text: conversion.original_text,
@@ -1032,7 +1149,7 @@ impl CaptureState {
         let delete_chars = self.current_segment_delete_chars(&typed_text);
         self.buffer.clear();
         self.prefix_visible = false;
-        self.marker_chars_visible = self.config.trigger_prefix.chars().count();
+        self.marker_chars_visible = 0;
         self.mode = CaptureMode::Active;
         self.last_conversion = None;
 
@@ -1053,6 +1170,14 @@ impl CaptureState {
                 .to_owned()
         } else {
             value.to_owned()
+        }
+    }
+
+    fn active_preview_body(&self) -> String {
+        if self.mode == CaptureMode::Active {
+            self.active_body_from(&self.buffer)
+        } else {
+            String::new()
         }
     }
 
@@ -1122,7 +1247,7 @@ impl ListenerRuntime {
         }
 
         if event.has_text_modifier() {
-            self.handle_modified_key(event);
+            self.handle_modified_key(event)?;
             return Ok(());
         }
 
@@ -1147,6 +1272,11 @@ impl ListenerRuntime {
                             "[listener] backspace -> buffer_chars={}",
                             self.capture.buffer.chars().count()
                         );
+                    }
+                    if self.capture.is_active() {
+                        self.refresh_candidate_panel()?;
+                    } else {
+                        mac::hide_candidate_panel();
                     }
                 }
                 return Ok(());
@@ -1178,6 +1308,8 @@ impl ListenerRuntime {
 
         if let Some(action) = action {
             self.handle_action(action)?;
+        } else if self.capture.is_active() {
+            self.refresh_candidate_panel()?;
         } else if self.options.log_events {
             println!(
                 "[listener] pushed text={text:?} buffer_chars={} buffer_tail={:?}",
@@ -1244,6 +1376,7 @@ impl ListenerRuntime {
         self.capture.clear();
         self.quote_state = QuoteState::default();
         self.session_input_source = None;
+        mac::hide_candidate_panel();
         if was_active {
             println!(
                 "[listener] active session cleared reason={} buffer_chars={} buffer_tail={:?}",
@@ -1254,21 +1387,24 @@ impl ListenerRuntime {
         }
     }
 
-    fn handle_modified_key(&mut self, event: mac::InputEvent) {
+    fn handle_modified_key(&mut self, event: mac::InputEvent) -> Result<()> {
         if event.has_control_modifier() && event.key_code == mac::KEY_W {
             self.capture.delete_previous_word();
+            if self.capture.is_active() {
+                self.refresh_candidate_panel()?;
+            }
             if self.options.log_events {
                 println!(
                     "[listener] ctrl+w -> delete previous word buffer_chars={}",
                     self.capture.buffer.chars().count()
                 );
             }
-            return;
+            return Ok(());
         }
 
         if event.has_control_modifier() && event.key_code == mac::KEY_C {
             self.clear_capture_context("control-c shortcut");
-            return;
+            return Ok(());
         }
 
         if event.has_command_modifier()
@@ -1278,7 +1414,7 @@ impl ListenerRuntime {
             )
         {
             self.clear_capture_context(&format!("command shortcut key {}", event.key_code));
-            return;
+            return Ok(());
         }
 
         if self.options.log_events {
@@ -1287,10 +1423,12 @@ impl ListenerRuntime {
                 event.key_code
             );
         }
+        Ok(())
     }
 
     fn handle_action(&mut self, action: CaptureAction) -> Result<()> {
         match action {
+            CaptureAction::StartSession(action) => self.handle_start_session(action),
             CaptureAction::Convert(action) => self.handle_conversion(action),
             CaptureAction::EndSession(action) => {
                 self.quote_state = QuoteState::default();
@@ -1304,9 +1442,19 @@ impl ListenerRuntime {
                 if !action.replacement_text.is_empty() {
                     mac::inject_string(&action.replacement_text, self.options.inject_delay_ms)?;
                 }
+                mac::hide_candidate_panel();
                 Ok(())
             }
         }
+    }
+
+    fn handle_start_session(&mut self, action: StartSessionAction) -> Result<()> {
+        println!(
+            "[listener] active session marker hidden delete_chars={} trigger={:?}",
+            action.delete_chars, action.trigger_text
+        );
+        mac::inject_backspaces(action.delete_chars, self.options.inject_delay_ms);
+        self.refresh_candidate_panel()
     }
 
     fn handle_conversion(&mut self, action: ConversionAction) -> Result<()> {
@@ -1331,10 +1479,7 @@ impl ListenerRuntime {
             output.segments.len(),
             output.output
         );
-        let mut injected_output = output.output.clone();
-        if action.stay_active {
-            injected_output.push_str(&self.capture.config.trigger_prefix);
-        }
+        let injected_output = output.output.clone();
         println!(
             "[listener] injecting delete_chars={} output_chars={}",
             delete_count,
@@ -1356,6 +1501,11 @@ impl ListenerRuntime {
             self.session_input_source = None;
             QuoteState::default()
         };
+        if action.stay_active {
+            self.refresh_candidate_panel()?;
+        } else {
+            mac::hide_candidate_panel();
+        }
 
         println!(
             "converted: {:?} -> {:?}",
@@ -1378,6 +1528,26 @@ impl ListenerRuntime {
         );
         mac::inject_backspaces(action.delete_remaining_chars, self.options.inject_delay_ms);
         mac::inject_string(&action.replacement_text, self.options.inject_delay_ms)?;
+        self.refresh_candidate_panel()?;
+        Ok(())
+    }
+
+    fn refresh_candidate_panel(&self) -> Result<()> {
+        if !self.capture.is_active() {
+            mac::hide_candidate_panel();
+            return Ok(());
+        }
+
+        let preview = preview_candidates(
+            &self.options,
+            &self.capture.active_preview_body(),
+            self.options.config.candidate_count,
+        )?;
+        mac::update_candidate_panel(
+            &preview.preedit,
+            &preview.candidates,
+            self.options.config.candidate_layout,
+        )?;
         Ok(())
     }
 
@@ -1415,6 +1585,75 @@ fn buffer_tail(value: &str, max_chars: usize) -> String {
     let chars = value.chars().collect::<Vec<_>>();
     let start = chars.len().saturating_sub(max_chars);
     chars[start..].iter().collect()
+}
+
+fn preview_candidates(
+    options: &Options,
+    body: &str,
+    candidate_count: usize,
+) -> Result<CandidatePreview> {
+    let raw = pending_pinyin_for_preview(body);
+    if raw.is_empty() {
+        return Ok(CandidatePreview {
+            preedit: "Rime active".to_owned(),
+            candidates: Vec::new(),
+        });
+    }
+
+    let normalized = normalize_pinyin_run(&raw);
+    if !normalized.chars().any(|ch| ch.is_ascii_alphanumeric()) {
+        return Ok(CandidatePreview {
+            preedit: raw,
+            candidates: Vec::new(),
+        });
+    }
+
+    let mut session = create_selected_session(&options.schema)?;
+    for ch in normalized.chars() {
+        let status = session.process_key(KeyEvent::new(ch as u32, 0));
+        if matches!(status, KeyStatus::Pass) {
+            session.close().context("failed to close Rime session")?;
+            return Ok(CandidatePreview {
+                preedit: raw,
+                candidates: Vec::new(),
+            });
+        }
+    }
+
+    let mut preedit = normalized.clone();
+    let mut candidates = Vec::new();
+    if let Some(context) = session.context() {
+        let composition = context.composition();
+        if let Some(value) = composition.preedit {
+            preedit = value.to_owned();
+        }
+        candidates = context
+            .menu()
+            .candidates
+            .iter()
+            .take(candidate_count)
+            .map(|candidate| candidate.text.to_owned())
+            .collect();
+    }
+
+    session.close().context("failed to close Rime session")?;
+    Ok(CandidatePreview {
+        preedit,
+        candidates,
+    })
+}
+
+fn pending_pinyin_for_preview(body: &str) -> String {
+    tokenize_body(body)
+        .into_iter()
+        .rev()
+        .find_map(|token| match token {
+            Token::Pinyin(value) if value.chars().any(|ch| ch.is_ascii_alphanumeric()) => {
+                Some(value)
+            }
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 fn convert_pinyin_run(options: &Options, raw: &str, normalized: &str) -> Result<ConvertedSegment> {
@@ -1591,6 +1830,11 @@ fn print_doctor(options: &Options) {
         "conversion_mode: {}",
         options.config.conversion_mode.as_str()
     );
+    println!(
+        "candidate_layout: {}",
+        options.config.candidate_layout.as_str()
+    );
+    println!("candidate_count: {}", options.config.candidate_count);
     println!("body_mode:       {}", options.body_mode);
     println!("listen:          {}", options.listen);
     println!("max_buffer_chars: {}", options.max_buffer_chars);
@@ -1652,6 +1896,8 @@ fn print_help() {
 Options:\n  \
 --config <FILE>          Trigger config file [env: RIME_POC_CONFIG] [default: ./rime-poc.toml if present]\n  \
 --conversion-mode <MODE> Conversion mode: segmented or rime-auto [env: RIME_POC_CONVERSION_MODE]\n  \
+--candidate-layout <LAYOUT> Candidate layout: horizontal or vertical [env: RIME_POC_CANDIDATE_LAYOUT] [default: horizontal]\n  \
+--candidate-count <N>    Candidate count shown in the UI, 1-20 [env: RIME_POC_CANDIDATE_COUNT] [default: 5]\n  \
 --listen                 Start macOS global listener mode\n  \
 --log-events             Print every key/mouse event seen by the listener [env: RIME_POC_LOG_EVENTS]\n  \
 --body                   Treat input as body text without requiring trigger prefix/suffix\n  \
@@ -1679,6 +1925,8 @@ mod tests {
             trigger_prefix: "[[".to_owned(),
             trigger_suffix: "]]".to_owned(),
             conversion_mode: ConversionMode::Segmented,
+            candidate_layout: CandidateLayout::Horizontal,
+            candidate_count: DEFAULT_CANDIDATE_COUNT,
         };
 
         let body = extract_body("[[woyaoceshi]]", &config, false).unwrap();
@@ -1692,6 +1940,8 @@ mod tests {
             trigger_prefix: ";;".to_owned(),
             trigger_suffix: "?".to_owned(),
             conversion_mode: ConversionMode::Segmented,
+            candidate_layout: CandidateLayout::Horizontal,
+            candidate_count: DEFAULT_CANDIDATE_COUNT,
         };
 
         let error = validate_config(&config).unwrap_err().to_string();
@@ -1702,6 +1952,8 @@ mod tests {
             trigger_prefix: "!".to_owned(),
             trigger_suffix: ";;".to_owned(),
             conversion_mode: ConversionMode::Segmented,
+            candidate_layout: CandidateLayout::Horizontal,
+            candidate_count: DEFAULT_CANDIDATE_COUNT,
         };
 
         let error = validate_config(&config).unwrap_err().to_string();
@@ -1727,31 +1979,44 @@ mod tests {
     fn starts_active_capture_after_trigger_prefix() {
         let mut capture = test_capture_state();
 
-        assert_eq!(capture.push_text(";;"), None);
+        assert_eq!(
+            capture.push_text(";;"),
+            Some(CaptureAction::StartSession(StartSessionAction {
+                trigger_text: ";;".to_owned(),
+                delete_chars: 2,
+            }))
+        );
 
         assert_eq!(capture.mode, CaptureMode::Active);
-        assert!(capture.prefix_visible);
-        assert_eq!(capture.buffer, ";;");
+        assert!(!capture.prefix_visible);
+        assert_eq!(capture.marker_chars_visible, 0);
+        assert!(capture.buffer.is_empty());
     }
 
     #[test]
     fn entering_active_state_isolates_previous_idle_buffer() {
         let mut capture = test_capture_state();
 
-        assert_eq!(capture.push_text("old text ;;"), None);
+        assert_eq!(
+            capture.push_text("old text ;;"),
+            Some(CaptureAction::StartSession(StartSessionAction {
+                trigger_text: ";;".to_owned(),
+                delete_chars: 2,
+            }))
+        );
 
         assert_eq!(capture.mode, CaptureMode::Active);
-        assert_eq!(capture.buffer, ";;");
+        assert!(capture.buffer.is_empty());
 
         let action = capture.push_text("ceshi ");
 
         assert_eq!(
             action,
             Some(CaptureAction::Convert(ConversionAction {
-                typed_text: ";;ceshi ".to_owned(),
+                typed_text: "ceshi ".to_owned(),
                 body: "ceshi".to_owned(),
                 restore_text: "ceshi".to_owned(),
-                delete_chars: ";;ceshi ".chars().count(),
+                delete_chars: "ceshi ".chars().count(),
                 stay_active: true,
             }))
         );
@@ -1767,19 +2032,16 @@ mod tests {
         assert_eq!(
             action,
             Some(CaptureAction::Convert(ConversionAction {
-                typed_text: ";;woyaoceshi ".to_owned(),
+                typed_text: "woyaoceshi ".to_owned(),
                 body: "woyaoceshi".to_owned(),
                 restore_text: "woyaoceshi".to_owned(),
-                delete_chars: ";;woyaoceshi ".chars().count(),
+                delete_chars: "woyaoceshi ".chars().count(),
                 stay_active: true,
             }))
         );
         assert_eq!(capture.mode, CaptureMode::Active);
         assert!(!capture.prefix_visible);
-        assert_eq!(
-            capture.marker_chars_visible,
-            capture.config.trigger_prefix.chars().count()
-        );
+        assert_eq!(capture.marker_chars_visible, 0);
         assert!(capture.buffer.is_empty());
     }
 
@@ -1793,10 +2055,10 @@ mod tests {
         assert_eq!(
             action,
             Some(CaptureAction::Convert(ConversionAction {
-                typed_text: ";;woyaoceshi,".to_owned(),
+                typed_text: "woyaoceshi,".to_owned(),
                 body: "woyaoceshi,".to_owned(),
                 restore_text: "woyaoceshi,".to_owned(),
-                delete_chars: ";;woyaoceshi,".chars().count(),
+                delete_chars: "woyaoceshi,".chars().count(),
                 stay_active: true,
             }))
         );
@@ -1812,10 +2074,10 @@ mod tests {
         assert_eq!(
             action,
             Some(CaptureAction::Convert(ConversionAction {
-                typed_text: ";;woyaoceshi:".to_owned(),
+                typed_text: "woyaoceshi:".to_owned(),
                 body: "woyaoceshi:".to_owned(),
                 restore_text: "woyaoceshi:".to_owned(),
-                delete_chars: ";;woyaoceshi:".chars().count(),
+                delete_chars: "woyaoceshi:".chars().count(),
                 stay_active: true,
             }))
         );
@@ -1830,7 +2092,7 @@ mod tests {
 
         assert_eq!(action, None);
         assert_eq!(capture.mode, CaptureMode::Active);
-        assert_eq!(capture.buffer, ";;woyaoceshi;");
+        assert_eq!(capture.buffer, "woyaoceshi;");
     }
 
     #[test]
@@ -1853,19 +2115,18 @@ mod tests {
     #[test]
     fn delete_previous_word_keeps_active_state() {
         let mut capture = test_capture_state();
-        capture.buffer = ";;woyao ceshi".to_owned();
+        capture.buffer = "woyao ceshi".to_owned();
         capture.mode = CaptureMode::Active;
-        capture.prefix_visible = true;
 
         capture.delete_previous_word();
 
         assert_eq!(capture.mode, CaptureMode::Active);
-        assert_eq!(capture.buffer, ";;woyao ");
+        assert_eq!(capture.buffer, "woyao ");
 
         capture.delete_previous_word();
 
-        assert_eq!(capture.mode, CaptureMode::Active);
-        assert_eq!(capture.buffer, ";;");
+        assert_eq!(capture.mode, CaptureMode::Idle);
+        assert!(capture.buffer.is_empty());
     }
 
     #[test]
@@ -1877,10 +2138,10 @@ mod tests {
         assert_eq!(
             action,
             Some(CaptureAction::Convert(ConversionAction {
-                typed_text: ";;woyaoceshi;;".to_owned(),
+                typed_text: "woyaoceshi;;".to_owned(),
                 body: "woyaoceshi".to_owned(),
                 restore_text: "woyaoceshi".to_owned(),
-                delete_chars: ";;woyaoceshi;;".chars().count(),
+                delete_chars: "woyaoceshi;;".chars().count(),
                 stay_active: false,
             }))
         );
@@ -1906,7 +2167,7 @@ mod tests {
             Some(CaptureAction::EndSession(EndSessionAction {
                 typed_text: ";;".to_owned(),
                 replacement_text: String::new(),
-                delete_chars: ";;;;".chars().count(),
+                delete_chars: ";;".chars().count(),
             }))
         );
         assert_eq!(capture.mode, CaptureMode::Idle);
@@ -1927,7 +2188,7 @@ mod tests {
                 typed_text: "ceshi;;".to_owned(),
                 body: "ceshi".to_owned(),
                 restore_text: "ceshi".to_owned(),
-                delete_chars: ";;ceshi;;".chars().count(),
+                delete_chars: "ceshi;;".chars().count(),
                 stay_active: false,
             }))
         );
@@ -1938,7 +2199,6 @@ mod tests {
     fn backspace_after_conversion_restores_original_text() {
         let mut capture = test_capture_state();
         let quote_state_before = QuoteState { next_is_open: true };
-        capture.marker_chars_visible = capture.config.trigger_prefix.chars().count();
         capture.mode = CaptureMode::Active;
         capture.record_conversion(
             "woyaoceshi".to_owned(),
@@ -1952,8 +2212,8 @@ mod tests {
             restore,
             Some(RestoreAction {
                 original_text: "woyaoceshi".to_owned(),
-                replacement_text: ";;woyaoceshi".to_owned(),
-                delete_remaining_chars: 5,
+                replacement_text: "woyaoceshi".to_owned(),
+                delete_remaining_chars: 3,
                 quote_state_before,
             })
         );
@@ -1963,9 +2223,8 @@ mod tests {
     }
 
     #[test]
-    fn backspace_to_empty_raw_buffer_keeps_active_when_marker_is_visible() {
+    fn backspace_to_empty_raw_buffer_exits_hidden_marker_session() {
         let mut capture = test_capture_state();
-        capture.marker_chars_visible = capture.config.trigger_prefix.chars().count();
         capture.mode = CaptureMode::Active;
         capture.buffer = "bug".to_owned();
 
@@ -1973,37 +2232,25 @@ mod tests {
         capture.backspace();
         capture.backspace();
 
-        assert_eq!(capture.mode, CaptureMode::Active);
-        assert_eq!(
-            capture.marker_chars_visible,
-            capture.config.trigger_prefix.chars().count()
-        );
+        assert_eq!(capture.mode, CaptureMode::Idle);
+        assert_eq!(capture.marker_chars_visible, 0);
         assert!(capture.buffer.is_empty());
 
         let action = capture.push_text("le ");
 
-        assert_eq!(
-            action,
-            Some(CaptureAction::Convert(ConversionAction {
-                typed_text: "le ".to_owned(),
-                body: "le".to_owned(),
-                restore_text: "le".to_owned(),
-                delete_chars: ";;le ".chars().count(),
-                stay_active: true,
-            }))
-        );
+        assert_eq!(action, None);
+        assert_eq!(capture.mode, CaptureMode::Idle);
     }
 
     #[test]
-    fn backspace_with_empty_raw_buffer_deletes_visible_marker() {
+    fn backspace_with_empty_raw_buffer_exits_hidden_marker_session() {
         let mut capture = test_capture_state();
-        capture.marker_chars_visible = capture.config.trigger_prefix.chars().count();
         capture.mode = CaptureMode::Active;
 
         capture.backspace();
 
-        assert_eq!(capture.mode, CaptureMode::Active);
-        assert_eq!(capture.marker_chars_visible, 1);
+        assert_eq!(capture.mode, CaptureMode::Idle);
+        assert_eq!(capture.marker_chars_visible, 0);
     }
 
     #[test]
@@ -2080,5 +2327,25 @@ mod tests {
             ConversionMode::RimeAuto
         );
         assert!(ConversionMode::parse("unknown").is_err());
+    }
+
+    #[test]
+    fn parses_candidate_layouts() {
+        assert_eq!(
+            CandidateLayout::parse("horizontal").unwrap(),
+            CandidateLayout::Horizontal
+        );
+        assert_eq!(
+            CandidateLayout::parse("vertical").unwrap(),
+            CandidateLayout::Vertical
+        );
+        assert!(CandidateLayout::parse("diagonal").is_err());
+    }
+
+    #[test]
+    fn validates_candidate_count_range() {
+        assert!(validate_runtime_options(128, 0, DEFAULT_CANDIDATE_COUNT).is_ok());
+        assert!(validate_runtime_options(128, 0, 0).is_err());
+        assert!(validate_runtime_options(128, 0, MAX_CANDIDATE_COUNT + 1).is_err());
     }
 }

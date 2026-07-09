@@ -116,6 +116,68 @@ The listener deletes the full trigger text with Backspace and injects:
 我要测试中文输入法，你好吗！
 ```
 
+The listener also supports incremental conversion after the prefix is typed.
+While the session is active, Space or any non-pinyin separator that is not part
+of the configured trigger converts the preceding pinyin immediately, so you do
+not have to wait for the closing trigger. Space acts like a commit key and is
+not reinserted; punctuation separators are kept and mapped where a mapping
+exists. Incremental conversion moves the visible active marker to the current
+editing position, after the committed output. Previously committed output is
+then treated as application-owned text: the closing trigger only removes the
+current marker, pending raw text, and suffix, and does not rewrite earlier
+converted text. Pressing Backspace immediately after an incremental conversion
+restores the original pinyin text with the active marker for editing.
+
+The configured trigger is reserved for state changes: with the default config,
+`;;` enters the active session and `;;` exits it. Trigger characters such as
+`;` are not treated as incremental separators, avoiding ambiguity between a
+single trigger character and the full trigger. Each opening trigger starts an
+isolated session; text before that trigger is not part of the active capture
+buffer. Mouse context changes, active application changes, input source changes,
+and Command-Tab/Command-Backtick window switch shortcuts clear the active
+session. The listener also records the macOS input source fingerprint when a
+session opens and verifies it on later key events; if the input route changes
+before conversion, it abandons the internal session without deleting or
+injecting text. Only macOS system input sources with `source=com.apple...` are
+allowed to open or continue a session; third-party input methods are ignored
+even if they are in an English/direct-input mode. Pressing Shift by itself
+aborts the active session, which covers IME Chinese/English toggles.
+Command-C,
+Control-C, and common Command editing shortcuts abort the session; Control-W
+keeps the session active and removes the previous raw pinyin word from the
+buffer. When the closing trigger exits the session, only the current visible
+marker and pending text are removed or converted.
+
+For example:
+
+```text
+;;woyaoceshi<Space>
+```
+
+leaves the visible text as:
+
+```text
+我要测试;;
+```
+
+Continuing from that state, typing:
+
+```text
+zhongwenshurufa<Space>
+```
+
+leaves:
+
+```text
+我要测试中文输入法;;
+```
+
+Typing the closing trigger then removes only the current marker and suffix:
+
+```text
+我要测试中文输入法
+```
+
 Useful listener flags:
 
 ```sh

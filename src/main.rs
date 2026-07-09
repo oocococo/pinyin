@@ -75,10 +75,47 @@ struct ConversionOutput {
     segments: Vec<ConvertedSegment>,
 }
 
-#[derive(Debug)]
-struct TriggerMatch {
-    full_text: String,
+#[derive(Debug, PartialEq, Eq)]
+enum CaptureAction {
+    Convert(ConversionAction),
+    EndSession(EndSessionAction),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ConversionAction {
+    typed_text: String,
     body: String,
+    restore_text: String,
+    delete_chars: usize,
+    stay_active: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct EndSessionAction {
+    typed_text: String,
+    replacement_text: String,
+    delete_chars: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RestoreAction {
+    original_text: String,
+    replacement_text: String,
+    delete_remaining_chars: usize,
+    quote_state_before: QuoteState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReversibleConversion {
+    original_text: String,
+    inserted_text: String,
+    quote_state_before: QuoteState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureMode {
+    Idle,
+    Active,
 }
 
 #[derive(Debug)]
@@ -86,6 +123,10 @@ struct CaptureState {
     buffer: String,
     config: AppConfig,
     max_buffer_chars: usize,
+    mode: CaptureMode,
+    prefix_visible: bool,
+    marker_chars_visible: usize,
+    last_conversion: Option<ReversibleConversion>,
 }
 
 #[cfg(target_os = "macos")]
@@ -93,6 +134,8 @@ struct CaptureState {
 struct ListenerRuntime {
     options: Options,
     capture: CaptureState,
+    quote_state: QuoteState,
+    session_input_source: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -374,14 +417,17 @@ fn extract_body(input: &str, config: &AppConfig, body_mode: bool) -> Result<Stri
 }
 
 fn ensure_body_has_pinyin(body: &str) -> Result<()> {
-    if tokenize_body(body)
-        .iter()
-        .all(|token| !matches!(token, Token::Pinyin(_)))
-    {
+    if !body_has_pinyin(body) {
         bail!("input body has no pinyin runs");
     }
 
     Ok(())
+}
+
+fn body_has_pinyin(body: &str) -> bool {
+    tokenize_body(body)
+        .iter()
+        .any(|token| matches!(token, Token::Pinyin(_)))
 }
 
 fn run_conversion(options: &Options, body: String) -> Result<()> {
@@ -440,7 +486,12 @@ fn run_listener(options: Options) -> Result<()> {
     }
 
     let capture = CaptureState::new(options.config.clone(), options.max_buffer_chars);
-    let runtime = ListenerRuntime { options, capture };
+    let runtime = ListenerRuntime {
+        options,
+        capture,
+        quote_state: QuoteState::default(),
+        session_input_source: None,
+    };
     LISTENER_RUNTIME
         .set(Mutex::new(runtime))
         .map_err(|_| anyhow!("listener runtime was already initialized"))?;
@@ -630,10 +681,18 @@ extern "C" fn mac_event_callback(event: mac::InputEvent) {
 }
 
 fn convert_body(options: &Options, body: String) -> Result<ConversionOutput> {
+    let mut quote_state = QuoteState::default();
+    convert_body_with_quote_state(options, body, &mut quote_state)
+}
+
+fn convert_body_with_quote_state(
+    options: &Options,
+    body: String,
+    quote_state: &mut QuoteState,
+) -> Result<ConversionOutput> {
     let tokens = tokenize_body(&body);
     let mut output = String::new();
     let mut segments = Vec::new();
-    let mut quote_state = QuoteState::default();
 
     for token in &tokens {
         match token {
@@ -647,7 +706,7 @@ fn convert_body(options: &Options, body: String) -> Result<ConversionOutput> {
                 segments.push(segment);
             }
             Token::Separator(value) => {
-                output.push_str(&map_separator(value, &mut quote_state));
+                output.push_str(&map_separator(value, quote_state));
             }
         }
     }
@@ -666,27 +725,145 @@ impl CaptureState {
             buffer: String::new(),
             config,
             max_buffer_chars,
+            mode: CaptureMode::Idle,
+            prefix_visible: false,
+            marker_chars_visible: 0,
+            last_conversion: None,
         }
     }
 
-    fn push_text(&mut self, text: &str) -> Option<TriggerMatch> {
+    fn push_text(&mut self, text: &str) -> Option<CaptureAction> {
+        let mut action = None;
+
         for ch in text.chars() {
             if ch.is_control() {
                 continue;
             }
-            self.buffer.push(ch);
-            self.trim_buffer();
+
+            if let Some(next_action) = self.push_char(ch) {
+                action = Some(next_action);
+            }
         }
 
-        self.try_match()
+        action
+    }
+
+    fn is_active(&self) -> bool {
+        self.mode == CaptureMode::Active || self.prefix_visible || self.marker_chars_visible > 0
+    }
+
+    fn push_char(&mut self, ch: char) -> Option<CaptureAction> {
+        self.last_conversion = None;
+        self.buffer.push(ch);
+        self.trim_buffer();
+
+        match self.mode {
+            CaptureMode::Idle => {
+                if self.buffer.ends_with(&self.config.trigger_prefix) {
+                    self.buffer = self.config.trigger_prefix.clone();
+                    self.mode = CaptureMode::Active;
+                    self.prefix_visible = true;
+                    self.marker_chars_visible = 0;
+                    self.last_conversion = None;
+                }
+                None
+            }
+            CaptureMode::Active => {
+                if let Some(action) = self.try_end_session() {
+                    return Some(action);
+                }
+
+                if self.is_commit_separator(ch) {
+                    return self.try_incremental_conversion();
+                }
+
+                None
+            }
+        }
     }
 
     fn backspace(&mut self) {
-        self.buffer.pop();
+        self.last_conversion = None;
+        if self.buffer.pop().is_some() {
+            if self.buffer.is_empty() {
+                self.prefix_visible = false;
+                if self.marker_chars_visible > 0 {
+                    self.mode = CaptureMode::Active;
+                } else {
+                    self.mode = CaptureMode::Idle;
+                    self.marker_chars_visible = 0;
+                }
+            } else if self.prefix_visible && !self.buffer.starts_with(&self.config.trigger_prefix) {
+                self.marker_chars_visible = self.buffer.chars().count();
+                self.buffer.clear();
+                self.mode = CaptureMode::Active;
+                self.prefix_visible = false;
+            }
+            return;
+        }
+
+        if self.marker_chars_visible > 0 {
+            self.marker_chars_visible -= 1;
+            self.prefix_visible = false;
+            if self.marker_chars_visible > 0 {
+                self.mode = CaptureMode::Active;
+                return;
+            }
+        }
+        self.mode = CaptureMode::Idle;
+    }
+
+    fn delete_previous_word(&mut self) {
+        self.last_conversion = None;
+
+        while self.buffer.chars().last().is_some_and(char::is_whitespace) {
+            self.buffer.pop();
+        }
+
+        while self.buffer.chars().last().is_some_and(is_pinyin_char) {
+            self.buffer.pop();
+        }
     }
 
     fn clear(&mut self) {
         self.buffer.clear();
+        self.mode = CaptureMode::Idle;
+        self.prefix_visible = false;
+        self.marker_chars_visible = 0;
+        self.last_conversion = None;
+    }
+
+    fn record_conversion(
+        &mut self,
+        original_text: String,
+        inserted_text: String,
+        quote_state_before: QuoteState,
+    ) {
+        self.last_conversion = Some(ReversibleConversion {
+            original_text,
+            inserted_text,
+            quote_state_before,
+        });
+    }
+
+    fn restore_last_conversion(&mut self) -> Option<RestoreAction> {
+        let conversion = self.last_conversion.take()?;
+        let marker_text = self.config.trigger_prefix.clone();
+        let delete_remaining_chars =
+            conversion.inserted_text.chars().count() + self.marker_chars_visible.saturating_sub(1);
+
+        self.buffer = conversion.original_text.clone();
+        self.mode = CaptureMode::Active;
+        self.prefix_visible = false;
+        self.marker_chars_visible = self.config.trigger_prefix.chars().count();
+        let replacement_text = format!("{}{}", marker_text, conversion.original_text);
+
+        Some(RestoreAction {
+            original_text: conversion.original_text,
+            replacement_text,
+            delete_remaining_chars,
+            quote_state_before: conversion.quote_state_before,
+        })
     }
 
     fn trim_buffer(&mut self) {
@@ -698,19 +875,90 @@ impl CaptureState {
         }
     }
 
-    fn try_match(&self) -> Option<TriggerMatch> {
+    fn try_end_session(&mut self) -> Option<CaptureAction> {
         if !self.buffer.ends_with(&self.config.trigger_suffix) {
             return None;
         }
 
         let suffix_start = self.buffer.len() - self.config.trigger_suffix.len();
-        let before_suffix = &self.buffer[..suffix_start];
-        let prefix_start = before_suffix.rfind(&self.config.trigger_prefix)?;
-        let body_start = prefix_start + self.config.trigger_prefix.len();
-        let body = before_suffix[body_start..].to_owned();
-        let full_text = self.buffer[prefix_start..].to_owned();
+        if self.prefix_visible && suffix_start < self.config.trigger_prefix.len() {
+            return None;
+        }
 
-        Some(TriggerMatch { full_text, body })
+        let typed_text = self.buffer.clone();
+        let body = self.active_body_from(&self.buffer[..suffix_start]);
+        let delete_chars = self.current_segment_delete_chars(&typed_text);
+        self.buffer.clear();
+        self.mode = CaptureMode::Idle;
+        self.prefix_visible = false;
+        self.marker_chars_visible = 0;
+        self.last_conversion = None;
+
+        if body_has_pinyin(&body) {
+            Some(CaptureAction::Convert(ConversionAction {
+                typed_text,
+                restore_text: body.clone(),
+                delete_chars,
+                body,
+                stay_active: false,
+            }))
+        } else {
+            Some(CaptureAction::EndSession(EndSessionAction {
+                typed_text,
+                replacement_text: body,
+                delete_chars,
+            }))
+        }
+    }
+
+    fn try_incremental_conversion(&mut self) -> Option<CaptureAction> {
+        let typed_text = self.buffer.clone();
+        let body = self.active_body_from(&typed_text);
+        let body = trim_commit_only_whitespace(&body).to_owned();
+        if !body_has_pinyin(&body) {
+            return None;
+        }
+
+        let delete_chars = self.current_segment_delete_chars(&typed_text);
+        self.buffer.clear();
+        self.prefix_visible = false;
+        self.marker_chars_visible = self.config.trigger_prefix.chars().count();
+        self.mode = CaptureMode::Active;
+        self.last_conversion = None;
+
+        Some(CaptureAction::Convert(ConversionAction {
+            typed_text,
+            restore_text: body.clone(),
+            delete_chars,
+            body,
+            stay_active: true,
+        }))
+    }
+
+    fn active_body_from(&self, value: &str) -> String {
+        if self.prefix_visible {
+            value
+                .strip_prefix(&self.config.trigger_prefix)
+                .unwrap_or(value)
+                .to_owned()
+        } else {
+            value.to_owned()
+        }
+    }
+
+    fn is_commit_separator(&self, ch: char) -> bool {
+        !is_pinyin_char(ch)
+            && !self.config.trigger_prefix.contains(ch)
+            && !self.config.trigger_suffix.contains(ch)
+    }
+
+    fn current_segment_delete_chars(&self, typed_text: &str) -> usize {
+        let typed_chars = typed_text.chars().count();
+        if self.prefix_visible {
+            typed_chars
+        } else {
+            self.marker_chars_visible + typed_chars
+        }
     }
 }
 
@@ -726,10 +974,17 @@ impl ListenerRuntime {
         }
 
         if event.event_type == mac::EVENT_MOUSE {
-            if self.options.log_events {
-                println!("[listener] mouse event -> clear buffer");
+            self.clear_capture_context("mouse event");
+            return Ok(());
+        }
+
+        if event.event_type == mac::EVENT_CONTEXT {
+            let context_reason = event.text();
+            if context_reason.is_empty() {
+                self.clear_capture_context("context changed");
+            } else {
+                self.clear_capture_context(&format!("context changed: {context_reason}"));
             }
-            self.capture.clear();
             return Ok(());
         }
 
@@ -737,14 +992,52 @@ impl ListenerRuntime {
             return Ok(());
         }
 
+        let input_source = event_input_source_fingerprint(&event);
+        if self.skip_if_input_source_is_not_system(&input_source) {
+            return Ok(());
+        }
+
+        if self.clear_if_session_input_source_changed(&input_source) {
+            return Ok(());
+        }
+
+        if matches!(event.key_code, mac::KEY_SHIFT_LEFT | mac::KEY_SHIFT_RIGHT) {
+            self.clear_capture_context("shift key");
+            return Ok(());
+        }
+
+        if event.has_command_modifier() && matches!(event.key_code, mac::KEY_TAB | mac::KEY_GRAVE) {
+            self.clear_capture_context("window switch shortcut");
+            return Ok(());
+        }
+
+        if event.has_text_modifier() {
+            self.handle_modified_key(event);
+            return Ok(());
+        }
+
         match event.key_code {
             mac::KEY_BACKSPACE => {
-                self.capture.backspace();
-                if self.options.log_events {
-                    println!(
-                        "[listener] backspace -> buffer_chars={}",
-                        self.capture.buffer.chars().count()
-                    );
+                if let Some(action) = self.capture.restore_last_conversion() {
+                    self.handle_restore(action)?;
+                } else {
+                    let was_active = self.capture.is_active();
+                    let buffer_chars = self.capture.buffer.chars().count();
+                    let buffer_tail = buffer_tail(&self.capture.buffer, 80);
+                    self.capture.backspace();
+                    if was_active && !self.capture.is_active() {
+                        self.quote_state = QuoteState::default();
+                        self.session_input_source = None;
+                        println!(
+                            "[listener] active session cleared reason=backspace buffer_chars={} buffer_tail={:?}",
+                            buffer_chars, buffer_tail
+                        );
+                    } else if self.options.log_events {
+                        println!(
+                            "[listener] backspace -> buffer_chars={}",
+                            self.capture.buffer.chars().count()
+                        );
+                    }
                 }
                 return Ok(());
             }
@@ -755,10 +1048,7 @@ impl ListenerRuntime {
             | mac::KEY_ARROW_RIGHT
             | mac::KEY_ARROW_DOWN
             | mac::KEY_ARROW_UP => {
-                self.capture.clear();
-                if self.options.log_events {
-                    println!("[listener] key {} -> clear buffer", event.key_code);
-                }
+                self.clear_capture_context(&format!("key {}", event.key_code));
                 return Ok(());
             }
             _ => {}
@@ -772,8 +1062,12 @@ impl ListenerRuntime {
             return Ok(());
         }
 
-        if let Some(matched) = self.capture.push_text(&text) {
-            self.handle_match(matched)?;
+        let was_active = self.capture.is_active();
+        let action = self.capture.push_text(&text);
+        self.record_session_input_source_if_opened(was_active, &input_source);
+
+        if let Some(action) = action {
+            self.handle_action(action)?;
         } else if self.options.log_events {
             println!(
                 "[listener] pushed text={text:?} buffer_chars={} buffer_tail={:?}",
@@ -785,44 +1079,226 @@ impl ListenerRuntime {
         Ok(())
     }
 
-    fn handle_match(&mut self, matched: TriggerMatch) -> Result<()> {
-        self.capture.clear();
-        let delete_count = matched.full_text.chars().count();
-        println!(
-            "[listener] trigger matched delete_chars={} body={:?}",
-            delete_count, matched.body
-        );
-        ensure_body_has_pinyin(&matched.body)?;
+    fn skip_if_input_source_is_not_system(&mut self, input_source: &str) -> bool {
+        if input_source_is_system(input_source) {
+            return false;
+        }
 
-        let output = convert_body(&self.options, matched.body)?;
+        let reason = format!("non-system input source: {input_source:?}");
+        if self.capture.is_active() {
+            self.clear_capture_context(&reason);
+        } else {
+            self.capture.clear();
+            self.quote_state = QuoteState::default();
+            self.session_input_source = None;
+            if self.options.log_events {
+                println!("[listener] {reason} -> skip inactive input");
+            }
+        }
+        true
+    }
+
+    fn clear_if_session_input_source_changed(&mut self, current_input_source: &str) -> bool {
+        if !self.capture.is_active() {
+            return false;
+        }
+
+        let Some(previous_input_source) = self.session_input_source.as_deref() else {
+            self.session_input_source = Some(current_input_source.to_owned());
+            return false;
+        };
+
+        if previous_input_source == current_input_source {
+            return false;
+        }
+
+        let reason =
+            format!("input source changed: {previous_input_source:?} -> {current_input_source:?}");
+        self.clear_capture_context(&reason);
+        true
+    }
+
+    fn record_session_input_source_if_opened(&mut self, was_active: bool, input_source: &str) {
+        if was_active || !self.capture.is_active() {
+            return;
+        }
+
+        self.session_input_source = Some(input_source.to_owned());
+        println!("[listener] active session opened input_source={input_source:?}");
+    }
+
+    fn clear_capture_context(&mut self, reason: &str) {
+        let was_active = self.capture.is_active();
+        let buffer_chars = self.capture.buffer.chars().count();
+        let buffer_tail = buffer_tail(&self.capture.buffer, 80);
+        self.capture.clear();
+        self.quote_state = QuoteState::default();
+        self.session_input_source = None;
+        if was_active {
+            println!(
+                "[listener] active session cleared reason={} buffer_chars={} buffer_tail={:?}",
+                reason, buffer_chars, buffer_tail
+            );
+        } else if self.options.log_events {
+            println!("[listener] {reason} -> clear inactive buffer");
+        }
+    }
+
+    fn handle_modified_key(&mut self, event: mac::InputEvent) {
+        if event.has_control_modifier() && event.key_code == mac::KEY_W {
+            self.capture.delete_previous_word();
+            if self.options.log_events {
+                println!(
+                    "[listener] ctrl+w -> delete previous word buffer_chars={}",
+                    self.capture.buffer.chars().count()
+                );
+            }
+            return;
+        }
+
+        if event.has_control_modifier() && event.key_code == mac::KEY_C {
+            self.clear_capture_context("control-c shortcut");
+            return;
+        }
+
+        if event.has_command_modifier()
+            && matches!(
+                event.key_code,
+                mac::KEY_A | mac::KEY_C | mac::KEY_V | mac::KEY_X | mac::KEY_Z
+            )
+        {
+            self.clear_capture_context(&format!("command shortcut key {}", event.key_code));
+            return;
+        }
+
+        if self.options.log_events {
+            println!(
+                "[listener] modified key {} ignored for capture buffer",
+                event.key_code
+            );
+        }
+    }
+
+    fn handle_action(&mut self, action: CaptureAction) -> Result<()> {
+        match action {
+            CaptureAction::Convert(action) => self.handle_conversion(action),
+            CaptureAction::EndSession(action) => {
+                self.quote_state = QuoteState::default();
+                self.session_input_source = None;
+                let delete_count = action.delete_chars;
+                println!(
+                    "[listener] session ended delete_chars={} typed={:?}",
+                    delete_count, action.typed_text
+                );
+                mac::inject_backspaces(delete_count, self.options.inject_delay_ms);
+                if !action.replacement_text.is_empty() {
+                    mac::inject_string(&action.replacement_text, self.options.inject_delay_ms)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn handle_conversion(&mut self, action: ConversionAction) -> Result<()> {
+        let delete_count = action.delete_chars;
+        let conversion_kind = if action.stay_active {
+            "incremental"
+        } else {
+            "final"
+        };
+        println!(
+            "[listener] {conversion_kind} conversion triggered delete_chars={} body={:?}",
+            delete_count, action.body
+        );
+        ensure_body_has_pinyin(&action.body)?;
+
+        let quote_state_before = self.quote_state;
+        let mut quote_state_after = self.quote_state;
+        let output =
+            convert_body_with_quote_state(&self.options, action.body, &mut quote_state_after)?;
         println!(
             "[listener] converted segments={} output={:?}",
             output.segments.len(),
             output.output
         );
+        let mut injected_output = output.output.clone();
+        if action.stay_active {
+            injected_output.push_str(&self.capture.config.trigger_prefix);
+        }
         println!(
             "[listener] injecting delete_chars={} output_chars={}",
             delete_count,
-            output.output.chars().count()
+            injected_output.chars().count()
         );
 
         mac::inject_backspaces(delete_count, self.options.inject_delay_ms);
-        mac::inject_string(&output.output, self.options.inject_delay_ms)?;
+        mac::inject_string(&injected_output, self.options.inject_delay_ms)?;
+        if action.stay_active {
+            self.capture.record_conversion(
+                action.restore_text,
+                output.output.clone(),
+                quote_state_before,
+            );
+        }
+        self.quote_state = if action.stay_active {
+            quote_state_after
+        } else {
+            self.session_input_source = None;
+            QuoteState::default()
+        };
 
-        println!("converted: {:?} -> {:?}", matched.full_text, output.output);
+        println!(
+            "converted: {:?} -> {:?}",
+            action.typed_text, injected_output
+        );
+        if !action.stay_active {
+            println!(
+                "[listener] session ended after final conversion typed={:?}",
+                action.typed_text
+            );
+        }
+        Ok(())
+    }
+
+    fn handle_restore(&mut self, action: RestoreAction) -> Result<()> {
+        self.quote_state = action.quote_state_before;
+        println!(
+            "[listener] restoring original text delete_remaining_chars={} original={:?}",
+            action.delete_remaining_chars, action.original_text
+        );
+        mac::inject_backspaces(action.delete_remaining_chars, self.options.inject_delay_ms);
+        mac::inject_string(&action.replacement_text, self.options.inject_delay_ms)?;
         Ok(())
     }
 
     fn log_event(&self, event: &mac::InputEvent) {
         println!(
-            "[event] type={} status={} key={} text={:?} buffer_chars={}",
+            "[event] type={} status={} key={} modifiers={} text={:?} input_source={:?} buffer_chars={}",
             event.event_type,
             event.status,
             event.key_code,
+            event.modifier_flags,
             event.text(),
+            event_input_source_fingerprint(event),
             self.capture.buffer.chars().count()
         );
     }
+}
+
+fn event_input_source_fingerprint(event: &mac::InputEvent) -> String {
+    let input_source = event.input_source_fingerprint();
+    if input_source.is_empty() {
+        "<unknown>".to_owned()
+    } else {
+        input_source
+    }
+}
+
+fn input_source_is_system(input_source: &str) -> bool {
+    input_source
+        .split('|')
+        .find_map(|part| part.strip_prefix("source="))
+        .is_some_and(|source| source.starts_with("com.apple."))
 }
 
 fn buffer_tail(value: &str, max_chars: usize) -> String {
@@ -958,7 +1434,11 @@ fn is_reserved_separator(ch: char) -> bool {
     )
 }
 
-#[derive(Debug, Default)]
+fn trim_commit_only_whitespace(value: &str) -> &str {
+    value.trim_end_matches(char::is_whitespace)
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct QuoteState {
     next_is_open: bool,
 }
@@ -1074,6 +1554,10 @@ Options:\n  \
 mod tests {
     use super::*;
 
+    fn test_capture_state() -> CaptureState {
+        CaptureState::new(AppConfig::default(), 128)
+    }
+
     #[test]
     fn extracts_body_with_configured_triggers() {
         let config = AppConfig {
@@ -1105,6 +1589,320 @@ mod tests {
         let error = validate_config(&config).unwrap_err().to_string();
 
         assert!(error.contains("trigger_prefix"));
+    }
+
+    #[test]
+    fn detects_system_input_source() {
+        assert!(!input_source_is_system(
+            "source=com.bytedance.inputmethod.doubaoime.pinyin|mode=com.bytedance.inputmethod.doubaoime.pinyin|type=TISTypeKeyboardInputMode|ascii=0"
+        ));
+        assert!(!input_source_is_system(
+            "source=com.bytedance.inputmethod.doubaoime.pinyin|mode=com.bytedance.inputmethod.doubaoime.pinyin|type=TISTypeKeyboardInputMode|ascii=1"
+        ));
+        assert!(input_source_is_system(
+            "source=com.apple.keylayout.ABC|mode=|type=TISTypeKeyboardLayout|ascii=1"
+        ));
+        assert!(!input_source_is_system("<unknown>"));
+    }
+
+    #[test]
+    fn starts_active_capture_after_trigger_prefix() {
+        let mut capture = test_capture_state();
+
+        assert_eq!(capture.push_text(";;"), None);
+
+        assert_eq!(capture.mode, CaptureMode::Active);
+        assert!(capture.prefix_visible);
+        assert_eq!(capture.buffer, ";;");
+    }
+
+    #[test]
+    fn entering_active_state_isolates_previous_idle_buffer() {
+        let mut capture = test_capture_state();
+
+        assert_eq!(capture.push_text("old text ;;"), None);
+
+        assert_eq!(capture.mode, CaptureMode::Active);
+        assert_eq!(capture.buffer, ";;");
+
+        let action = capture.push_text("ceshi ");
+
+        assert_eq!(
+            action,
+            Some(CaptureAction::Convert(ConversionAction {
+                typed_text: ";;ceshi ".to_owned(),
+                body: "ceshi".to_owned(),
+                restore_text: "ceshi".to_owned(),
+                delete_chars: ";;ceshi ".chars().count(),
+                stay_active: true,
+            }))
+        );
+    }
+
+    #[test]
+    fn space_triggers_incremental_conversion_without_restoring_space() {
+        let mut capture = test_capture_state();
+        capture.push_text(";;");
+
+        let action = capture.push_text("woyaoceshi ");
+
+        assert_eq!(
+            action,
+            Some(CaptureAction::Convert(ConversionAction {
+                typed_text: ";;woyaoceshi ".to_owned(),
+                body: "woyaoceshi".to_owned(),
+                restore_text: "woyaoceshi".to_owned(),
+                delete_chars: ";;woyaoceshi ".chars().count(),
+                stay_active: true,
+            }))
+        );
+        assert_eq!(capture.mode, CaptureMode::Active);
+        assert!(!capture.prefix_visible);
+        assert_eq!(
+            capture.marker_chars_visible,
+            capture.config.trigger_prefix.chars().count()
+        );
+        assert!(capture.buffer.is_empty());
+    }
+
+    #[test]
+    fn punctuation_triggers_incremental_conversion_and_keeps_separator() {
+        let mut capture = test_capture_state();
+        capture.push_text(";;");
+
+        let action = capture.push_text("woyaoceshi,");
+
+        assert_eq!(
+            action,
+            Some(CaptureAction::Convert(ConversionAction {
+                typed_text: ";;woyaoceshi,".to_owned(),
+                body: "woyaoceshi,".to_owned(),
+                restore_text: "woyaoceshi,".to_owned(),
+                delete_chars: ";;woyaoceshi,".chars().count(),
+                stay_active: true,
+            }))
+        );
+    }
+
+    #[test]
+    fn arbitrary_non_pinyin_separator_triggers_incremental_conversion() {
+        let mut capture = test_capture_state();
+        capture.push_text(";;");
+
+        let action = capture.push_text("woyaoceshi:");
+
+        assert_eq!(
+            action,
+            Some(CaptureAction::Convert(ConversionAction {
+                typed_text: ";;woyaoceshi:".to_owned(),
+                body: "woyaoceshi:".to_owned(),
+                restore_text: "woyaoceshi:".to_owned(),
+                delete_chars: ";;woyaoceshi:".chars().count(),
+                stay_active: true,
+            }))
+        );
+    }
+
+    #[test]
+    fn trigger_characters_do_not_trigger_incremental_conversion() {
+        let mut capture = test_capture_state();
+        capture.push_text(";;");
+
+        let action = capture.push_text("woyaoceshi;");
+
+        assert_eq!(action, None);
+        assert_eq!(capture.mode, CaptureMode::Active);
+        assert_eq!(capture.buffer, ";;woyaoceshi;");
+    }
+
+    #[test]
+    fn clear_exits_active_state_and_drops_restore_history() {
+        let mut capture = test_capture_state();
+        capture.push_text(";;woyaoceshi");
+        capture.record_conversion(
+            "woyaoceshi".to_owned(),
+            "我要测试".to_owned(),
+            QuoteState::default(),
+        );
+
+        capture.clear();
+
+        assert_eq!(capture.mode, CaptureMode::Idle);
+        assert!(capture.buffer.is_empty());
+        assert_eq!(capture.restore_last_conversion(), None);
+    }
+
+    #[test]
+    fn delete_previous_word_keeps_active_state() {
+        let mut capture = test_capture_state();
+        capture.buffer = ";;woyao ceshi".to_owned();
+        capture.mode = CaptureMode::Active;
+        capture.prefix_visible = true;
+
+        capture.delete_previous_word();
+
+        assert_eq!(capture.mode, CaptureMode::Active);
+        assert_eq!(capture.buffer, ";;woyao ");
+
+        capture.delete_previous_word();
+
+        assert_eq!(capture.mode, CaptureMode::Active);
+        assert_eq!(capture.buffer, ";;");
+    }
+
+    #[test]
+    fn suffix_still_converts_pending_body_and_ends_session() {
+        let mut capture = test_capture_state();
+
+        let action = capture.push_text(";;woyaoceshi;;");
+
+        assert_eq!(
+            action,
+            Some(CaptureAction::Convert(ConversionAction {
+                typed_text: ";;woyaoceshi;;".to_owned(),
+                body: "woyaoceshi".to_owned(),
+                restore_text: "woyaoceshi".to_owned(),
+                delete_chars: ";;woyaoceshi;;".chars().count(),
+                stay_active: false,
+            }))
+        );
+        assert_eq!(capture.mode, CaptureMode::Idle);
+        assert!(capture.buffer.is_empty());
+    }
+
+    #[test]
+    fn suffix_after_incremental_conversion_removes_visible_marker() {
+        let mut capture = test_capture_state();
+        capture.push_text(";;");
+        capture.push_text("woyaoceshi ");
+        capture.record_conversion(
+            "woyaoceshi".to_owned(),
+            "我要测试".to_owned(),
+            QuoteState::default(),
+        );
+
+        let action = capture.push_text(";;");
+
+        assert_eq!(
+            action,
+            Some(CaptureAction::EndSession(EndSessionAction {
+                typed_text: ";;".to_owned(),
+                replacement_text: String::new(),
+                delete_chars: ";;;;".chars().count(),
+            }))
+        );
+        assert_eq!(capture.mode, CaptureMode::Idle);
+    }
+
+    #[test]
+    fn suffix_after_incremental_conversion_converts_pending_body_and_removes_marker() {
+        let mut capture = test_capture_state();
+        capture.push_text(";;");
+        capture.push_text("woyao ");
+        capture.record_conversion("woyao".to_owned(), "我要".to_owned(), QuoteState::default());
+
+        let action = capture.push_text("ceshi;;");
+
+        assert_eq!(
+            action,
+            Some(CaptureAction::Convert(ConversionAction {
+                typed_text: "ceshi;;".to_owned(),
+                body: "ceshi".to_owned(),
+                restore_text: "ceshi".to_owned(),
+                delete_chars: ";;ceshi;;".chars().count(),
+                stay_active: false,
+            }))
+        );
+        assert_eq!(capture.mode, CaptureMode::Idle);
+    }
+
+    #[test]
+    fn backspace_after_conversion_restores_original_text() {
+        let mut capture = test_capture_state();
+        let quote_state_before = QuoteState { next_is_open: true };
+        capture.marker_chars_visible = capture.config.trigger_prefix.chars().count();
+        capture.mode = CaptureMode::Active;
+        capture.record_conversion(
+            "woyaoceshi".to_owned(),
+            "我要测试".to_owned(),
+            quote_state_before,
+        );
+
+        let restore = capture.restore_last_conversion();
+
+        assert_eq!(
+            restore,
+            Some(RestoreAction {
+                original_text: "woyaoceshi".to_owned(),
+                replacement_text: ";;woyaoceshi".to_owned(),
+                delete_remaining_chars: 5,
+                quote_state_before,
+            })
+        );
+        assert_eq!(capture.mode, CaptureMode::Active);
+        assert_eq!(capture.buffer, "woyaoceshi");
+        assert!(!capture.prefix_visible);
+    }
+
+    #[test]
+    fn backspace_to_empty_raw_buffer_keeps_active_when_marker_is_visible() {
+        let mut capture = test_capture_state();
+        capture.marker_chars_visible = capture.config.trigger_prefix.chars().count();
+        capture.mode = CaptureMode::Active;
+        capture.buffer = "bug".to_owned();
+
+        capture.backspace();
+        capture.backspace();
+        capture.backspace();
+
+        assert_eq!(capture.mode, CaptureMode::Active);
+        assert_eq!(
+            capture.marker_chars_visible,
+            capture.config.trigger_prefix.chars().count()
+        );
+        assert!(capture.buffer.is_empty());
+
+        let action = capture.push_text("le ");
+
+        assert_eq!(
+            action,
+            Some(CaptureAction::Convert(ConversionAction {
+                typed_text: "le ".to_owned(),
+                body: "le".to_owned(),
+                restore_text: "le".to_owned(),
+                delete_chars: ";;le ".chars().count(),
+                stay_active: true,
+            }))
+        );
+    }
+
+    #[test]
+    fn backspace_with_empty_raw_buffer_deletes_visible_marker() {
+        let mut capture = test_capture_state();
+        capture.marker_chars_visible = capture.config.trigger_prefix.chars().count();
+        capture.mode = CaptureMode::Active;
+
+        capture.backspace();
+
+        assert_eq!(capture.mode, CaptureMode::Active);
+        assert_eq!(capture.marker_chars_visible, 1);
+    }
+
+    #[test]
+    fn backspace_after_deleting_all_marker_chars_exits_active_state() {
+        let mut capture = test_capture_state();
+        capture.marker_chars_visible = capture.config.trigger_prefix.chars().count();
+        capture.mode = CaptureMode::Active;
+
+        capture.backspace();
+
+        assert_eq!(capture.mode, CaptureMode::Active);
+        assert_eq!(capture.marker_chars_visible, 1);
+
+        capture.backspace();
+
+        assert_eq!(capture.mode, CaptureMode::Idle);
+        assert_eq!(capture.marker_chars_visible, 0);
     }
 
     #[test]

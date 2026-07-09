@@ -153,9 +153,10 @@ enum CaptureMode {
     Active,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CaptureState {
     buffer: String,
+    buffer_visible: Vec<bool>,
     config: AppConfig,
     max_buffer_chars: usize,
     mode: CaptureMode,
@@ -939,6 +940,7 @@ impl CaptureState {
     fn new(config: AppConfig, max_buffer_chars: usize) -> Self {
         Self {
             buffer: String::new(),
+            buffer_visible: Vec::new(),
             config,
             max_buffer_chars,
             mode: CaptureMode::Idle,
@@ -949,6 +951,10 @@ impl CaptureState {
     }
 
     fn push_text(&mut self, text: &str) -> Option<CaptureAction> {
+        self.push_text_with_visibility(text, true)
+    }
+
+    fn push_text_with_visibility(&mut self, text: &str, visible: bool) -> Option<CaptureAction> {
         let mut action = None;
 
         for ch in text.chars() {
@@ -956,7 +962,7 @@ impl CaptureState {
                 continue;
             }
 
-            if let Some(next_action) = self.push_char(ch) {
+            if let Some(next_action) = self.push_char(ch, visible) {
                 action = Some(next_action);
             }
         }
@@ -964,21 +970,28 @@ impl CaptureState {
         action
     }
 
+    fn will_rewrite_after_text(&self, text: &str) -> bool {
+        let mut next = self.clone();
+        next.push_text(text).is_some()
+    }
+
     fn is_active(&self) -> bool {
         self.mode == CaptureMode::Active || self.prefix_visible || self.marker_chars_visible > 0
     }
 
-    fn push_char(&mut self, ch: char) -> Option<CaptureAction> {
+    fn push_char(&mut self, ch: char, visible: bool) -> Option<CaptureAction> {
         self.last_conversion = None;
         self.buffer.push(ch);
+        self.buffer_visible.push(visible);
         self.trim_buffer();
 
         match self.mode {
             CaptureMode::Idle => {
                 if self.buffer.ends_with(&self.config.trigger_prefix) {
                     let trigger_text = self.config.trigger_prefix.clone();
-                    let delete_chars = trigger_text.chars().count();
+                    let delete_chars = self.visible_tail_chars(trigger_text.chars().count());
                     self.buffer.clear();
+                    self.buffer_visible.clear();
                     self.mode = CaptureMode::Active;
                     self.prefix_visible = false;
                     self.marker_chars_visible = 0;
@@ -1007,6 +1020,7 @@ impl CaptureState {
     fn backspace(&mut self) {
         self.last_conversion = None;
         if self.buffer.pop().is_some() {
+            self.buffer_visible.pop();
             if self.buffer.is_empty() {
                 self.prefix_visible = false;
                 self.mode = CaptureMode::Idle;
@@ -1014,6 +1028,7 @@ impl CaptureState {
             } else if self.prefix_visible && !self.buffer.starts_with(&self.config.trigger_prefix) {
                 self.marker_chars_visible = self.buffer.chars().count();
                 self.buffer.clear();
+                self.buffer_visible.clear();
                 self.mode = CaptureMode::Active;
                 self.prefix_visible = false;
             }
@@ -1036,10 +1051,12 @@ impl CaptureState {
 
         while self.buffer.chars().last().is_some_and(char::is_whitespace) {
             self.buffer.pop();
+            self.buffer_visible.pop();
         }
 
         while self.buffer.chars().last().is_some_and(is_pinyin_char) {
             self.buffer.pop();
+            self.buffer_visible.pop();
         }
 
         if self.mode == CaptureMode::Active && self.buffer.is_empty() {
@@ -1051,6 +1068,7 @@ impl CaptureState {
 
     fn clear(&mut self) {
         self.buffer.clear();
+        self.buffer_visible.clear();
         self.mode = CaptureMode::Idle;
         self.prefix_visible = false;
         self.marker_chars_visible = 0;
@@ -1080,6 +1098,7 @@ impl CaptureState {
         };
 
         self.buffer = conversion.original_text.clone();
+        self.buffer_visible = vec![true; conversion.original_text.chars().count()];
         self.mode = CaptureMode::Active;
         self.prefix_visible = false;
         self.marker_chars_visible = 0;
@@ -1099,6 +1118,9 @@ impl CaptureState {
                 return;
             };
             self.buffer.drain(..first.len_utf8());
+            if !self.buffer_visible.is_empty() {
+                self.buffer_visible.remove(0);
+            }
         }
     }
 
@@ -1114,8 +1136,9 @@ impl CaptureState {
 
         let typed_text = self.buffer.clone();
         let body = self.active_body_from(&self.buffer[..suffix_start]);
-        let delete_chars = self.current_segment_delete_chars(&typed_text);
+        let delete_chars = self.current_segment_delete_chars();
         self.buffer.clear();
+        self.buffer_visible.clear();
         self.mode = CaptureMode::Idle;
         self.prefix_visible = false;
         self.marker_chars_visible = 0;
@@ -1146,8 +1169,9 @@ impl CaptureState {
             return None;
         }
 
-        let delete_chars = self.current_segment_delete_chars(&typed_text);
+        let delete_chars = self.current_segment_delete_chars();
         self.buffer.clear();
+        self.buffer_visible.clear();
         self.prefix_visible = false;
         self.marker_chars_visible = 0;
         self.mode = CaptureMode::Active;
@@ -1187,8 +1211,26 @@ impl CaptureState {
             && !self.config.trigger_suffix.contains(ch)
     }
 
-    fn current_segment_delete_chars(&self, typed_text: &str) -> usize {
-        let typed_chars = typed_text.chars().count();
+    fn visible_buffer_chars(&self) -> usize {
+        self.buffer_visible
+            .iter()
+            .copied()
+            .filter(|visible| *visible)
+            .count()
+    }
+
+    fn visible_tail_chars(&self, tail_chars: usize) -> usize {
+        self.buffer_visible
+            .iter()
+            .rev()
+            .take(tail_chars)
+            .copied()
+            .filter(|visible| *visible)
+            .count()
+    }
+
+    fn current_segment_delete_chars(&self) -> usize {
+        let typed_chars = self.visible_buffer_chars();
         if self.prefix_visible {
             typed_chars
         } else {
@@ -1303,7 +1345,12 @@ impl ListenerRuntime {
         }
 
         let was_active = self.capture.is_active();
-        let action = self.capture.push_text(&text);
+        if self.capture.will_rewrite_after_text(&text) {
+            mac::begin_rewrite_transaction();
+        }
+        let action = self
+            .capture
+            .push_text_with_visibility(&text, !event.is_buffered_replay());
         self.record_session_input_source_if_opened(was_active, &input_source);
 
         if let Some(action) = action {
@@ -1438,10 +1485,7 @@ impl ListenerRuntime {
                     "[listener] session ended delete_chars={} typed={:?}",
                     delete_count, action.typed_text
                 );
-                mac::inject_backspaces(delete_count, self.options.inject_delay_ms);
-                if !action.replacement_text.is_empty() {
-                    mac::inject_string(&action.replacement_text, self.options.inject_delay_ms)?;
-                }
+                self.perform_rewrite(delete_count, &action.replacement_text)?;
                 mac::hide_candidate_panel();
                 Ok(())
             }
@@ -1453,7 +1497,7 @@ impl ListenerRuntime {
             "[listener] active session marker hidden delete_chars={} trigger={:?}",
             action.delete_chars, action.trigger_text
         );
-        mac::inject_backspaces(action.delete_chars, self.options.inject_delay_ms);
+        self.perform_rewrite(action.delete_chars, "")?;
         self.refresh_candidate_panel()
     }
 
@@ -1486,8 +1530,7 @@ impl ListenerRuntime {
             injected_output.chars().count()
         );
 
-        mac::inject_backspaces(delete_count, self.options.inject_delay_ms);
-        mac::inject_string(&injected_output, self.options.inject_delay_ms)?;
+        self.perform_rewrite(delete_count, &injected_output)?;
         if action.stay_active {
             self.capture.record_conversion(
                 action.restore_text,
@@ -1526,10 +1569,31 @@ impl ListenerRuntime {
             "[listener] restoring original text delete_remaining_chars={} original={:?}",
             action.delete_remaining_chars, action.original_text
         );
-        mac::inject_backspaces(action.delete_remaining_chars, self.options.inject_delay_ms);
-        mac::inject_string(&action.replacement_text, self.options.inject_delay_ms)?;
+        self.perform_rewrite(action.delete_remaining_chars, &action.replacement_text)?;
         self.refresh_candidate_panel()?;
         Ok(())
+    }
+
+    fn perform_rewrite(&self, delete_chars: usize, replacement_text: &str) -> Result<()> {
+        if delete_chars == 0 && replacement_text.is_empty() {
+            return Ok(());
+        }
+
+        if self.options.log_events {
+            println!(
+                "[listener] rewrite operation queued delete_chars={} replacement_chars={} delay_ms={}",
+                delete_chars,
+                replacement_text.chars().count(),
+                self.options.inject_delay_ms
+            );
+        }
+
+        mac::begin_rewrite_transaction();
+        mac::commit_rewrite_transaction(
+            delete_chars,
+            replacement_text,
+            self.options.inject_delay_ms,
+        )
     }
 
     fn refresh_candidate_panel(&self) -> Result<()> {
@@ -2027,6 +2091,7 @@ mod tests {
         let mut capture = test_capture_state();
         capture.push_text(";;");
 
+        assert!(capture.will_rewrite_after_text("woyaoceshi "));
         let action = capture.push_text("woyaoceshi ");
 
         assert_eq!(
@@ -2043,6 +2108,28 @@ mod tests {
         assert!(!capture.prefix_visible);
         assert_eq!(capture.marker_chars_visible, 0);
         assert!(capture.buffer.is_empty());
+    }
+
+    #[test]
+    fn buffered_replay_conversion_does_not_delete_host_text() {
+        let mut capture = test_capture_state();
+        capture.push_text(";;");
+
+        let action = capture.push_text_with_visibility("woyaoceshi ", false);
+
+        assert_eq!(
+            action,
+            Some(CaptureAction::Convert(ConversionAction {
+                typed_text: "woyaoceshi ".to_owned(),
+                body: "woyaoceshi".to_owned(),
+                restore_text: "woyaoceshi".to_owned(),
+                delete_chars: 0,
+                stay_active: true,
+            }))
+        );
+        assert_eq!(capture.mode, CaptureMode::Active);
+        assert!(capture.buffer.is_empty());
+        assert!(capture.buffer_visible.is_empty());
     }
 
     #[test]
@@ -2088,6 +2175,7 @@ mod tests {
         let mut capture = test_capture_state();
         capture.push_text(";;");
 
+        assert!(!capture.will_rewrite_after_text("woyaoceshi;"));
         let action = capture.push_text("woyaoceshi;");
 
         assert_eq!(action, None);

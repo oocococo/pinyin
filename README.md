@@ -155,6 +155,18 @@ without deleting or injecting text. Only macOS system input sources with
 input methods are ignored even if they are in an English/direct-input mode.
 Pressing Shift by itself aborts the active session, which covers IME
 Chinese/English toggles.
+During the short rewrite window where the listener deletes raw pinyin and
+injects converted text, the macOS event tap temporarily buffers ordinary typed
+characters and replays them into the active session after the rewrite finishes.
+For separator-triggered conversion, this rewrite transaction starts before the
+separator is handed to the capture state and Rime conversion path. Each
+delete-and-inject rewrite is queued as one native operation; the next rewrite
+does not start until the previous operation has posted its backspaces, posted its
+replacement text, settled briefly, and replayed buffered input. If replayed
+buffered input triggers another rewrite, replay pauses and keeps the remaining
+events queued for the next transaction, so repeated fast conversions stay
+serialized. Outside that rewrite transaction, key events are observed and passed
+through.
 Command-C,
 Control-C, and common Command editing shortcuts abort the session; Control-W
 keeps the session active and removes the previous raw pinyin word from the

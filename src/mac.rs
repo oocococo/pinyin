@@ -3,7 +3,7 @@ use std::{
     os::raw::{c_char, c_int, c_uint},
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use super::CandidateLayout;
 
@@ -15,6 +15,7 @@ pub const STATUS_PRESSED: i32 = 1;
 pub const MODIFIER_COMMAND: u32 = 1 << 0;
 pub const MODIFIER_CONTROL: u32 = 1 << 1;
 pub const MODIFIER_OPTION: u32 = 1 << 2;
+pub const MODIFIER_BUFFERED_REPLAY: u32 = 1 << 4;
 
 pub const KEY_BACKSPACE: u32 = 51;
 pub const KEY_ENTER: u32 = 36;
@@ -81,6 +82,11 @@ impl InputEvent {
         let flags = self.modifier_flags as u32;
         flags & (MODIFIER_COMMAND | MODIFIER_CONTROL | MODIFIER_OPTION) != 0
     }
+
+    pub fn is_buffered_replay(&self) -> bool {
+        let flags = self.modifier_flags as u32;
+        flags & MODIFIER_BUFFERED_REPLAY != 0
+    }
 }
 
 pub fn is_accessibility_trusted(prompt: bool) -> bool {
@@ -93,16 +99,6 @@ pub fn has_input_monitoring_access() -> bool {
 
 pub fn request_input_monitoring_access() -> bool {
     unsafe { pal_pinyin_request_input_monitoring_access() }
-}
-
-pub fn inject_backspaces(count: usize, delay_ms: i32) {
-    unsafe { pal_pinyin_inject_backspaces(count as c_uint, delay_ms) };
-}
-
-pub fn inject_string(text: &str, delay_ms: i32) -> Result<()> {
-    let text = CString::new(text)?;
-    unsafe { pal_pinyin_inject_string(text.as_ptr(), delay_ms) };
-    Ok(())
 }
 
 pub fn update_candidate_panel(
@@ -124,6 +120,23 @@ pub fn hide_candidate_panel() {
     unsafe { pal_pinyin_hide_candidate_panel() };
 }
 
+pub fn begin_rewrite_transaction() {
+    unsafe { pal_pinyin_begin_rewrite_transaction() };
+}
+
+pub fn commit_rewrite_transaction(
+    delete_chars: usize,
+    replacement_text: &str,
+    delay_ms: i32,
+) -> Result<()> {
+    let text = CString::new(replacement_text)
+        .context("replacement text contains an interior NUL byte and cannot be injected")?;
+    unsafe {
+        pal_pinyin_commit_rewrite_transaction(delete_chars as c_uint, text.as_ptr(), delay_ms);
+    }
+    Ok(())
+}
+
 pub fn start_event_loop(callback: extern "C" fn(InputEvent)) -> ! {
     unsafe { pal_pinyin_start_event_loop(callback) };
     unreachable!("macOS event loop returned unexpectedly")
@@ -134,12 +147,16 @@ unsafe extern "C" {
     fn pal_pinyin_has_input_monitoring_access() -> bool;
     fn pal_pinyin_request_input_monitoring_access() -> bool;
     fn pal_pinyin_start_event_loop(callback: extern "C" fn(InputEvent));
-    fn pal_pinyin_inject_backspaces(count: c_uint, delay_ms: c_int);
-    fn pal_pinyin_inject_string(string: *const c_char, delay_ms: c_int);
     fn pal_pinyin_update_candidate_panel(
         preedit: *const c_char,
         candidates: *const c_char,
         layout: c_int,
     );
     fn pal_pinyin_hide_candidate_panel();
+    fn pal_pinyin_begin_rewrite_transaction();
+    fn pal_pinyin_commit_rewrite_transaction(
+        delete_chars: c_uint,
+        replacement_text: *const c_char,
+        delay_ms: c_int,
+    );
 }

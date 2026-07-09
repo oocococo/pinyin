@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <string>
 #include <unistd.h>
 #include <vector>
 
@@ -50,12 +51,26 @@ static NSView *PAL_CANDIDATE_CONTENT = nil;
 static CFMachPortRef PAL_EVENT_TAP = nullptr;
 static CFRunLoopSourceRef PAL_EVENT_TAP_SOURCE = nullptr;
 static bool PAL_LOG_EVENTS = false;
+static bool PAL_REWRITE_TRANSACTION_ACTIVE = false;
+static uint64_t PAL_REWRITE_TRANSACTION_GENERATION = 0;
+static std::vector<PalInputEvent> PAL_REWRITE_BUFFERED_EVENTS;
+static std::vector<uint32_t> PAL_REWRITE_SWALLOWED_KEYUPS;
+static bool PAL_REWRITE_OPERATION_RUNNING = false;
+
+struct PalRewriteOperation {
+  uint32_t delete_count;
+  std::string replacement_text;
+  int32_t delay_ms;
+};
+
+static std::vector<PalRewriteOperation> PAL_REWRITE_OPERATION_QUEUE;
 
 enum {
   PAL_INPUT_MODIFIER_COMMAND = 1 << 0,
   PAL_INPUT_MODIFIER_CONTROL = 1 << 1,
   PAL_INPUT_MODIFIER_OPTION = 1 << 2,
   PAL_INPUT_MODIFIER_SHIFT = 1 << 3,
+  PAL_INPUT_MODIFIER_BUFFERED_REPLAY = 1 << 4,
 };
 
 static bool native_event_logging_enabled() {
@@ -260,9 +275,199 @@ static void copy_cg_event_text(PalInputEvent *input, CGEventRef event) {
   CFRelease(string);
 }
 
-static void dispatch_cg_event(CGEventType type, CGEventRef event) {
-  if (PAL_CALLBACK == nullptr) {
+static bool pal_input_has_text_modifier(PalInputEvent input) {
+  return (input.modifier_flags &
+          (PAL_INPUT_MODIFIER_COMMAND | PAL_INPUT_MODIFIER_CONTROL | PAL_INPUT_MODIFIER_OPTION)) != 0;
+}
+
+static bool pal_take_swallowed_keyup(uint32_t key_code) {
+  for (auto it = PAL_REWRITE_SWALLOWED_KEYUPS.begin();
+       it != PAL_REWRITE_SWALLOWED_KEYUPS.end();
+       ++it) {
+    if (*it == key_code) {
+      PAL_REWRITE_SWALLOWED_KEYUPS.erase(it);
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool pal_maybe_buffer_rewrite_event(PalInputEvent input) {
+  if (!PAL_REWRITE_TRANSACTION_ACTIVE || input.event_type != PAL_INPUT_EVENT_KEYBOARD) {
+    return false;
+  }
+
+  if (input.status == PAL_INPUT_STATUS_RELEASED) {
+    return pal_take_swallowed_keyup(input.key_code);
+  }
+
+  if (input.buffer_len == 0 || pal_input_has_text_modifier(input)) {
+    return false;
+  }
+
+  PAL_REWRITE_BUFFERED_EVENTS.push_back(input);
+  PAL_REWRITE_SWALLOWED_KEYUPS.push_back(input.key_code);
+  if (PAL_LOG_EVENTS) {
+    fprintf(stderr,
+            "[rime-poc native] rewrite transaction buffered key=%u chars=%s len=%lu\n",
+            input.key_code,
+            input.buffer_len > 0 ? input.buffer : "<empty>",
+            (unsigned long)input.buffer_len);
+    fflush(stderr);
+  }
+  return true;
+}
+
+static void pal_replay_rewrite_buffered_events(std::vector<PalInputEvent> events) {
+  if (events.empty() || PAL_CALLBACK == nullptr) {
     return;
+  }
+
+  if (PAL_LOG_EVENTS) {
+    fprintf(stderr,
+            "[rime-poc native] replaying %lu rewrite transaction buffered events\n",
+            (unsigned long)events.size());
+    fflush(stderr);
+  }
+
+  for (size_t i = 0; i < events.size(); i++) {
+    PalInputEvent input = events[i];
+    input.modifier_flags |= PAL_INPUT_MODIFIER_BUFFERED_REPLAY;
+    PAL_CALLBACK(input);
+    if (PAL_REWRITE_TRANSACTION_ACTIVE) {
+      size_t remaining_count = events.size() - i - 1;
+      if (remaining_count > 0) {
+        PAL_REWRITE_BUFFERED_EVENTS.insert(
+            PAL_REWRITE_BUFFERED_EVENTS.end(),
+            events.begin() + i + 1,
+            events.end());
+      }
+      if (PAL_LOG_EVENTS) {
+        fprintf(stderr,
+                "[rime-poc native] paused replay for nested rewrite transaction remaining=%lu\n",
+                (unsigned long)remaining_count);
+        fflush(stderr);
+      }
+      return;
+    }
+  }
+}
+
+static void pal_post_backspaces_now(uint32_t count, int32_t delay_ms) {
+  for (uint32_t i = 0; i < count; i++) {
+    post_key(0x33, true, delay_ms);
+    post_key(0x33, false, delay_ms);
+  }
+}
+
+static void pal_post_unicode_text_now(const std::string &text, int32_t delay_ms) {
+  if (text.empty()) {
+    return;
+  }
+
+  NSString *ns_string = [NSString stringWithUTF8String:text.c_str()];
+  if (ns_string == nil) {
+    return;
+  }
+
+  CFStringRef cf_string = (__bridge CFStringRef)ns_string;
+  std::vector<UniChar> buffer(ns_string.length);
+  CFStringGetCharacters(cf_string, CFRangeMake(0, ns_string.length), buffer.data());
+
+  size_t index = 0;
+  while (index < buffer.size()) {
+    size_t chunk_size = 20;
+    if (index + chunk_size > buffer.size()) {
+      chunk_size = buffer.size() - index;
+    }
+
+    CGEventRef keydown = CGEventCreateKeyboardEvent(NULL, 0x31, true);
+    CGEventSetLocation(keydown, CGPointMake(PAL_EVENT_MARKER, 0));
+    CGEventKeyboardSetUnicodeString(keydown, (UniCharCount)chunk_size, buffer.data() + index);
+    CGEventPost(kCGHIDEventTap, keydown);
+    CFRelease(keydown);
+    usleep(delay_ms * 1000);
+
+    CGEventRef keyup = CGEventCreateKeyboardEvent(NULL, 0x31, false);
+    CGEventSetLocation(keyup, CGPointMake(PAL_EVENT_MARKER, 0));
+    CGEventPost(kCGHIDEventTap, keyup);
+    CFRelease(keyup);
+    usleep(delay_ms * 1000);
+
+    index += chunk_size;
+  }
+}
+
+static void pal_start_next_rewrite_operation();
+
+static void pal_finish_current_rewrite_operation(uint64_t generation) {
+  dispatch_after(
+      dispatch_time(DISPATCH_TIME_NOW, 80 * NSEC_PER_MSEC),
+      dispatch_get_main_queue(),
+      ^{
+        @autoreleasepool {
+          if (!PAL_REWRITE_TRANSACTION_ACTIVE ||
+              generation != PAL_REWRITE_TRANSACTION_GENERATION) {
+            return;
+          }
+
+          PAL_REWRITE_TRANSACTION_ACTIVE = false;
+          PAL_REWRITE_OPERATION_RUNNING = false;
+          PAL_REWRITE_SWALLOWED_KEYUPS.clear();
+          std::vector<PalInputEvent> events = PAL_REWRITE_BUFFERED_EVENTS;
+          PAL_REWRITE_BUFFERED_EVENTS.clear();
+          if (PAL_LOG_EVENTS) {
+            fprintf(stderr,
+                    "[rime-poc native] rewrite operation finish generation=%llu buffered=%lu queued=%lu\n",
+                    (unsigned long long)generation,
+                    (unsigned long)events.size(),
+                    (unsigned long)PAL_REWRITE_OPERATION_QUEUE.size());
+            fflush(stderr);
+          }
+          pal_replay_rewrite_buffered_events(events);
+          if (!PAL_REWRITE_TRANSACTION_ACTIVE) {
+            pal_start_next_rewrite_operation();
+          }
+        }
+      });
+}
+
+static void pal_start_next_rewrite_operation() {
+  if (PAL_REWRITE_OPERATION_RUNNING) {
+    return;
+  }
+  if (PAL_REWRITE_OPERATION_QUEUE.empty()) {
+    return;
+  }
+
+  PalRewriteOperation operation = PAL_REWRITE_OPERATION_QUEUE.front();
+  PAL_REWRITE_OPERATION_QUEUE.erase(PAL_REWRITE_OPERATION_QUEUE.begin());
+  PAL_REWRITE_OPERATION_RUNNING = true;
+  if (!PAL_REWRITE_TRANSACTION_ACTIVE) {
+    PAL_REWRITE_TRANSACTION_ACTIVE = true;
+    PAL_REWRITE_TRANSACTION_GENERATION += 1;
+    PAL_REWRITE_BUFFERED_EVENTS.clear();
+    PAL_REWRITE_SWALLOWED_KEYUPS.clear();
+  }
+  uint64_t generation = PAL_REWRITE_TRANSACTION_GENERATION;
+  if (PAL_LOG_EVENTS) {
+    fprintf(stderr,
+            "[rime-poc native] rewrite operation begin generation=%llu delete=%u replacement_len=%lu queued=%lu\n",
+            (unsigned long long)generation,
+            operation.delete_count,
+            (unsigned long)operation.replacement_text.size(),
+            (unsigned long)PAL_REWRITE_OPERATION_QUEUE.size());
+    fflush(stderr);
+  }
+
+  pal_post_backspaces_now(operation.delete_count, operation.delay_ms);
+  pal_post_unicode_text_now(operation.replacement_text, operation.delay_ms);
+  pal_finish_current_rewrite_operation(generation);
+}
+
+static bool dispatch_cg_event(CGEventType type, CGEventRef event) {
+  if (PAL_CALLBACK == nullptr) {
+    return false;
   }
 
   CGPoint location = CGEventGetLocation(event);
@@ -271,7 +476,7 @@ static void dispatch_cg_event(CGEventType type, CGEventRef event) {
       fprintf(stderr, "[rime-poc native] skipped marked/self CGEvent type=%u\n", type);
       fflush(stderr);
     }
-    return;
+    return false;
   }
 
   PalInputEvent input = {};
@@ -306,8 +511,12 @@ static void dispatch_cg_event(CGEventType type, CGEventRef event) {
       fflush(stderr);
     }
 
+    if (pal_maybe_buffer_rewrite_event(input)) {
+      return true;
+    }
+
     PAL_CALLBACK(input);
-    return;
+    return false;
   }
 
   input.event_type = PAL_INPUT_EVENT_MOUSE;
@@ -324,6 +533,7 @@ static void dispatch_cg_event(CGEventType type, CGEventRef event) {
   }
 
   PAL_CALLBACK(input);
+  return false;
 }
 
 static CGEventRef event_tap_callback(
@@ -343,8 +553,8 @@ static CGEventRef event_tap_callback(
     return event;
   }
 
-  dispatch_cg_event(type, event);
-  return event;
+  bool consumed = dispatch_cg_event(type, event);
+  return consumed ? nullptr : event;
 }
 
 static NSTextField *pal_make_label(NSString *text, NSFont *font, NSColor *color) {
@@ -869,6 +1079,84 @@ extern "C" void pal_pinyin_hide_candidate_panel() {
   });
 }
 
+extern "C" void pal_pinyin_begin_rewrite_transaction() {
+  if (PAL_REWRITE_TRANSACTION_ACTIVE) {
+    if (PAL_LOG_EVENTS) {
+      fprintf(stderr,
+              "[rime-poc native] rewrite transaction already active generation=%llu buffered=%lu\n",
+              (unsigned long long)PAL_REWRITE_TRANSACTION_GENERATION,
+              (unsigned long)PAL_REWRITE_BUFFERED_EVENTS.size());
+      fflush(stderr);
+    }
+    return;
+  }
+
+  PAL_REWRITE_TRANSACTION_ACTIVE = true;
+  PAL_REWRITE_TRANSACTION_GENERATION += 1;
+  PAL_REWRITE_BUFFERED_EVENTS.clear();
+  PAL_REWRITE_SWALLOWED_KEYUPS.clear();
+  if (PAL_LOG_EVENTS) {
+    fprintf(stderr,
+            "[rime-poc native] rewrite transaction begin generation=%llu\n",
+            (unsigned long long)PAL_REWRITE_TRANSACTION_GENERATION);
+    fflush(stderr);
+  }
+}
+
+extern "C" void pal_pinyin_finish_rewrite_transaction_after_delay(int32_t delay_ms) {
+  int64_t clamped_delay_ms = delay_ms < 0 ? 0 : delay_ms;
+  uint64_t generation = PAL_REWRITE_TRANSACTION_GENERATION;
+  dispatch_after(
+      dispatch_time(DISPATCH_TIME_NOW, clamped_delay_ms * NSEC_PER_MSEC),
+      dispatch_get_main_queue(),
+      ^{
+        @autoreleasepool {
+          if (!PAL_REWRITE_TRANSACTION_ACTIVE ||
+              generation != PAL_REWRITE_TRANSACTION_GENERATION) {
+            return;
+          }
+
+          PAL_REWRITE_TRANSACTION_ACTIVE = false;
+          PAL_REWRITE_SWALLOWED_KEYUPS.clear();
+          std::vector<PalInputEvent> events = PAL_REWRITE_BUFFERED_EVENTS;
+          PAL_REWRITE_BUFFERED_EVENTS.clear();
+          if (PAL_LOG_EVENTS) {
+            fprintf(stderr,
+                    "[rime-poc native] rewrite transaction finish generation=%llu buffered=%lu\n",
+                    (unsigned long long)generation,
+                    (unsigned long)events.size());
+            fflush(stderr);
+          }
+          pal_replay_rewrite_buffered_events(events);
+        }
+      });
+}
+
+extern "C" void pal_pinyin_commit_rewrite_transaction(
+    uint32_t delete_count,
+    const char *replacement_text,
+    int32_t delay_ms) {
+  std::string replacement = replacement_text == nullptr ? "" : replacement_text;
+  int32_t clamped_delay_ms = delay_ms < 0 ? 0 : delay_ms;
+  dispatch_async(dispatch_get_main_queue(), ^{
+    @autoreleasepool {
+      PAL_REWRITE_OPERATION_QUEUE.push_back(
+          PalRewriteOperation{delete_count, replacement, clamped_delay_ms});
+      if (PAL_LOG_EVENTS) {
+        fprintf(stderr,
+                "[rime-poc native] rewrite operation queued delete=%u replacement_len=%lu queued=%lu active=%d running=%d\n",
+                delete_count,
+                (unsigned long)replacement.size(),
+                (unsigned long)PAL_REWRITE_OPERATION_QUEUE.size(),
+                PAL_REWRITE_TRANSACTION_ACTIVE ? 1 : 0,
+                PAL_REWRITE_OPERATION_RUNNING ? 1 : 0);
+        fflush(stderr);
+      }
+      pal_start_next_rewrite_operation();
+    }
+  });
+}
+
 extern "C" void pal_pinyin_start_event_loop(PalEventCallback callback) {
   PAL_CALLBACK = callback;
 
@@ -912,7 +1200,7 @@ extern "C" void pal_pinyin_start_event_loop(PalEventCallback callback) {
     PAL_EVENT_TAP = CGEventTapCreate(
         kCGSessionEventTap,
         kCGHeadInsertEventTap,
-        kCGEventTapOptionListenOnly,
+        kCGEventTapOptionDefault,
         tap_mask,
         event_tap_callback,
         nullptr);

@@ -71,6 +71,7 @@ enum {
   PAL_INPUT_MODIFIER_OPTION = 1 << 2,
   PAL_INPUT_MODIFIER_SHIFT = 1 << 3,
   PAL_INPUT_MODIFIER_BUFFERED_REPLAY = 1 << 4,
+  PAL_INPUT_MODIFIER_REWRITE_ACTIVE = 1 << 5,
 };
 
 static bool native_event_logging_enabled() {
@@ -129,6 +130,18 @@ static uint32_t pal_modifier_flags_from_ns(NSEventModifierFlags flags) {
 
 static void copy_current_input_source_fingerprint(PalInputEvent *input);
 
+static bool pal_rewrite_is_busy() {
+  return PAL_REWRITE_TRANSACTION_ACTIVE ||
+      PAL_REWRITE_OPERATION_RUNNING ||
+      !PAL_REWRITE_OPERATION_QUEUE.empty();
+}
+
+static void pal_mark_rewrite_active(PalInputEvent *input) {
+  if (pal_rewrite_is_busy()) {
+    input->modifier_flags |= PAL_INPUT_MODIFIER_REWRITE_ACTIVE;
+  }
+}
+
 static void dispatch_context_event(const char *reason) {
   if (PAL_CALLBACK == nullptr) {
     return;
@@ -142,6 +155,7 @@ static void dispatch_context_event(const char *reason) {
   input.buffer[sizeof(input.buffer) - 1] = '\0';
   input.buffer_len = strlen(input.buffer);
   copy_current_input_source_fingerprint(&input);
+  pal_mark_rewrite_active(&input);
 
   if (PAL_LOG_EVENTS) {
     fprintf(stderr,
@@ -497,6 +511,7 @@ static bool dispatch_cg_event(CGEventType type, CGEventRef event) {
       copy_cg_event_text(&input, event);
     }
     copy_current_input_source_fingerprint(&input);
+    pal_mark_rewrite_active(&input);
 
     if (PAL_LOG_EVENTS) {
       fprintf(stderr,
@@ -523,6 +538,7 @@ static bool dispatch_cg_event(CGEventType type, CGEventRef event) {
   input.status = PAL_INPUT_STATUS_PRESSED;
   input.key_code = 0;
   copy_current_input_source_fingerprint(&input);
+  pal_mark_rewrite_active(&input);
 
   if (PAL_LOG_EVENTS) {
     fprintf(stderr,
@@ -1259,6 +1275,7 @@ extern "C" void pal_pinyin_start_event_loop(PalEventCallback callback) {
             input.status = PAL_INPUT_STATUS_RELEASED;
           }
           copy_current_input_source_fingerprint(&input);
+          pal_mark_rewrite_active(&input);
 
           if (event.type != NSEventTypeFlagsChanged) {
             NSString *characters = event.characters;
@@ -1293,6 +1310,7 @@ extern "C" void pal_pinyin_start_event_loop(PalEventCallback callback) {
         input.status = PAL_INPUT_STATUS_PRESSED;
         input.key_code = 0;
         copy_current_input_source_fingerprint(&input);
+        pal_mark_rewrite_active(&input);
         if (PAL_LOG_EVENTS) {
           fprintf(stderr,
                   "[rime-poc native] mouse event type=%ld source=%s\n",

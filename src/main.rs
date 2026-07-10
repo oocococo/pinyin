@@ -979,6 +979,10 @@ impl CaptureState {
         self.mode == CaptureMode::Active || self.prefix_visible || self.marker_chars_visible > 0
     }
 
+    fn active_exit_backspace_count(&self) -> usize {
+        self.config.trigger_prefix.chars().count().max(1)
+    }
+
     fn push_char(&mut self, ch: char, visible: bool) -> Option<CaptureAction> {
         self.last_conversion = None;
         self.buffer.push(ch);
@@ -994,7 +998,7 @@ impl CaptureState {
                     self.buffer_visible.clear();
                     self.mode = CaptureMode::Active;
                     self.prefix_visible = false;
-                    self.marker_chars_visible = 0;
+                    self.marker_chars_visible = self.active_exit_backspace_count();
                     self.last_conversion = None;
                     return Some(CaptureAction::StartSession(StartSessionAction {
                         trigger_text,
@@ -1004,6 +1008,8 @@ impl CaptureState {
                 None
             }
             CaptureMode::Active => {
+                self.marker_chars_visible = 0;
+
                 if let Some(action) = self.try_end_session() {
                     return Some(action);
                 }
@@ -1023,8 +1029,12 @@ impl CaptureState {
             self.buffer_visible.pop();
             if self.buffer.is_empty() {
                 self.prefix_visible = false;
-                self.mode = CaptureMode::Idle;
-                self.marker_chars_visible = 0;
+                if self.mode != CaptureMode::Active {
+                    self.mode = CaptureMode::Idle;
+                    self.marker_chars_visible = 0;
+                } else {
+                    self.marker_chars_visible = self.active_exit_backspace_count();
+                }
             } else if self.prefix_visible && !self.buffer.starts_with(&self.config.trigger_prefix) {
                 self.marker_chars_visible = self.buffer.chars().count();
                 self.buffer.clear();
@@ -1251,11 +1261,23 @@ impl ListenerRuntime {
         }
 
         if event.event_type == mac::EVENT_MOUSE {
+            if event.is_rewrite_active() {
+                if self.options.log_events {
+                    println!("[listener] ignored mouse event during rewrite transaction");
+                }
+                return Ok(());
+            }
             self.clear_capture_context("mouse event");
             return Ok(());
         }
 
         if event.event_type == mac::EVENT_CONTEXT {
+            if event.is_rewrite_active() {
+                if self.options.log_events {
+                    println!("[listener] ignored context event during rewrite transaction");
+                }
+                return Ok(());
+            }
             let context_reason = event.text();
             if context_reason.is_empty() {
                 self.clear_capture_context("context changed");
@@ -1862,6 +1884,8 @@ fn map_separator(value: &str, quote_state: &mut QuoteState) -> String {
         "." => "。".to_owned(),
         "?" => "？".to_owned(),
         "!" => "！".to_owned(),
+        ":" => "：".to_owned(),
+        ";" => "；".to_owned(),
         "-" => "－".to_owned(),
         "+" => "＋".to_owned(),
         "..." => "……".to_owned(),
@@ -2053,7 +2077,7 @@ mod tests {
 
         assert_eq!(capture.mode, CaptureMode::Active);
         assert!(!capture.prefix_visible);
-        assert_eq!(capture.marker_chars_visible, 0);
+        assert_eq!(capture.marker_chars_visible, 2);
         assert!(capture.buffer.is_empty());
     }
 
@@ -2149,6 +2173,24 @@ mod tests {
                 stay_active: true,
             }))
         );
+    }
+
+    #[test]
+    fn punctuation_separator_is_committed_as_chinese_punctuation() {
+        let mut quote_state = QuoteState::default();
+
+        assert_eq!(map_separator(",", &mut quote_state), "，");
+        assert_eq!(map_separator(".", &mut quote_state), "。");
+        assert_eq!(map_separator(":", &mut quote_state), "：");
+        assert_eq!(map_separator(";", &mut quote_state), "；");
+
+        let mut capture = test_capture_state();
+        capture.push_text(";;");
+        let action = capture.push_text("woyaoceshi ");
+        assert!(matches!(
+            action,
+            Some(CaptureAction::Convert(ConversionAction { body, .. })) if body == "woyaoceshi"
+        ));
     }
 
     #[test]
@@ -2311,29 +2353,45 @@ mod tests {
     }
 
     #[test]
-    fn backspace_to_empty_raw_buffer_exits_hidden_marker_session() {
+    fn backspace_to_empty_raw_buffer_keeps_hidden_marker_session() {
         let mut capture = test_capture_state();
         capture.mode = CaptureMode::Active;
         capture.buffer = "bug".to_owned();
+        capture.buffer_visible = vec![true; 3];
 
         capture.backspace();
         capture.backspace();
         capture.backspace();
 
-        assert_eq!(capture.mode, CaptureMode::Idle);
-        assert_eq!(capture.marker_chars_visible, 0);
+        assert_eq!(capture.mode, CaptureMode::Active);
+        assert_eq!(capture.marker_chars_visible, 2);
         assert!(capture.buffer.is_empty());
 
         let action = capture.push_text("le ");
 
-        assert_eq!(action, None);
-        assert_eq!(capture.mode, CaptureMode::Idle);
+        assert_eq!(
+            action,
+            Some(CaptureAction::Convert(ConversionAction {
+                typed_text: "le ".to_owned(),
+                body: "le".to_owned(),
+                restore_text: "le".to_owned(),
+                delete_chars: "le ".chars().count(),
+                stay_active: true,
+            }))
+        );
+        assert_eq!(capture.mode, CaptureMode::Active);
     }
 
     #[test]
-    fn backspace_with_empty_raw_buffer_exits_hidden_marker_session() {
+    fn backspace_with_empty_raw_buffer_consumes_trigger_length_before_exit() {
         let mut capture = test_capture_state();
         capture.mode = CaptureMode::Active;
+        capture.marker_chars_visible = capture.active_exit_backspace_count();
+
+        capture.backspace();
+
+        assert_eq!(capture.mode, CaptureMode::Active);
+        assert_eq!(capture.marker_chars_visible, 1);
 
         capture.backspace();
 

@@ -16,6 +16,7 @@ pub const MODIFIER_COMMAND: u32 = 1 << 0;
 pub const MODIFIER_CONTROL: u32 = 1 << 1;
 pub const MODIFIER_OPTION: u32 = 1 << 2;
 pub const MODIFIER_BUFFERED_REPLAY: u32 = 1 << 4;
+pub const MODIFIER_REWRITE_ACTIVE: u32 = 1 << 5;
 
 pub const KEY_BACKSPACE: u32 = 51;
 pub const KEY_ENTER: u32 = 36;
@@ -86,6 +87,11 @@ impl InputEvent {
     pub fn is_buffered_replay(&self) -> bool {
         let flags = self.modifier_flags as u32;
         flags & MODIFIER_BUFFERED_REPLAY != 0
+    }
+
+    pub fn is_rewrite_active(&self) -> bool {
+        let flags = self.modifier_flags as u32;
+        flags & MODIFIER_REWRITE_ACTIVE != 0
     }
 }
 

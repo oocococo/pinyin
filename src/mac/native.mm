@@ -4,6 +4,7 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <Foundation/Foundation.h>
 
+#include <algorithm>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -55,6 +56,9 @@ static uint64_t PAL_REWRITE_TRANSACTION_GENERATION = 0;
 static std::vector<PalInputEvent> PAL_REWRITE_BUFFERED_EVENTS;
 static std::vector<uint32_t> PAL_REWRITE_SWALLOWED_KEYUPS;
 static bool PAL_REWRITE_OPERATION_RUNNING = false;
+static std::vector<std::string> PAL_SHIFTED_KEY_TEXT(128);
+static std::vector<std::string> PAL_CAPS_LOCK_KEY_TEXT(128);
+static std::vector<std::string> PAL_SHIFTED_CAPS_LOCK_KEY_TEXT(128);
 
 struct PalRewriteOperation {
   uint32_t delete_count;
@@ -107,6 +111,118 @@ static uint32_t pal_modifier_flags_from_cg(CGEventFlags flags) {
 }
 
 static void copy_current_input_source_fingerprint(PalInputEvent *input);
+
+static void pal_populate_keyboard_layout_text(
+    const UCKeyboardLayout *layout,
+    UInt32 keyboard_type,
+    UInt32 carbon_modifiers,
+    std::vector<std::string> *table) {
+  for (std::string &text : *table) {
+    text.clear();
+  }
+
+  for (UInt16 key_code = 0; key_code < table->size(); key_code++) {
+    UInt32 dead_key_state = 0;
+    UniChar chars[32] = {};
+    UniCharCount actual_length = 0;
+    OSStatus status = UCKeyTranslate(
+        layout,
+        key_code,
+        kUCKeyActionDown,
+        (carbon_modifiers >> 8) & 0xff,
+        keyboard_type,
+        kUCKeyTranslateNoDeadKeysBit,
+        &dead_key_state,
+        (UniCharCount)(sizeof(chars) / sizeof(chars[0])),
+        &actual_length,
+        chars);
+    if (status != noErr || actual_length == 0) {
+      continue;
+    }
+
+    CFStringRef string = CFStringCreateWithCharacters(
+        kCFAllocatorDefault,
+        chars,
+        actual_length);
+    if (string != nullptr) {
+      char buffer[64] = {};
+      if (CFStringGetCString(string, buffer, sizeof(buffer), kCFStringEncodingUTF8)) {
+        (*table)[key_code] = buffer;
+      }
+      CFRelease(string);
+    }
+  }
+}
+
+static void pal_refresh_keyboard_layout() {
+  PAL_SHIFTED_KEY_TEXT.assign(PAL_SHIFTED_KEY_TEXT.size(), std::string());
+  PAL_CAPS_LOCK_KEY_TEXT.assign(PAL_CAPS_LOCK_KEY_TEXT.size(), std::string());
+  PAL_SHIFTED_CAPS_LOCK_KEY_TEXT.assign(
+      PAL_SHIFTED_CAPS_LOCK_KEY_TEXT.size(),
+      std::string());
+
+  TISInputSourceRef source = TISCopyCurrentKeyboardLayoutInputSource();
+  if (source == nullptr) {
+    return;
+  }
+
+  CFDataRef layout_data = (CFDataRef)TISGetInputSourceProperty(
+      source,
+      kTISPropertyUnicodeKeyLayoutData);
+  if (layout_data == nullptr) {
+    CFRelease(source);
+    return;
+  }
+
+  const UCKeyboardLayout *layout =
+      (const UCKeyboardLayout *)CFDataGetBytePtr(layout_data);
+  if (layout == nullptr) {
+    CFRelease(source);
+    return;
+  }
+
+  UInt32 keyboard_type = LMGetKbdType();
+  pal_populate_keyboard_layout_text(
+      layout,
+      keyboard_type,
+      shiftKey,
+      &PAL_SHIFTED_KEY_TEXT);
+  pal_populate_keyboard_layout_text(
+      layout,
+      keyboard_type,
+      alphaLock,
+      &PAL_CAPS_LOCK_KEY_TEXT);
+  pal_populate_keyboard_layout_text(
+      layout,
+      keyboard_type,
+      shiftKey | alphaLock,
+      &PAL_SHIFTED_CAPS_LOCK_KEY_TEXT);
+  CFRelease(source);
+}
+
+static const std::string *modified_keyboard_layout_text(CGEventRef event) {
+  int64_t key_code = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
+  if (key_code < 0 || (size_t)key_code >= PAL_SHIFTED_KEY_TEXT.size()) {
+    return nullptr;
+  }
+
+  CGEventFlags flags = CGEventGetFlags(event);
+  bool shifted = (flags & kCGEventFlagMaskShift) != 0;
+  bool caps_locked = (flags & kCGEventFlagMaskAlphaShift) != 0;
+  const std::vector<std::string> *table = nullptr;
+  if (shifted && caps_locked) {
+    table = &PAL_SHIFTED_CAPS_LOCK_KEY_TEXT;
+  } else if (shifted) {
+    table = &PAL_SHIFTED_KEY_TEXT;
+  } else if (caps_locked) {
+    table = &PAL_CAPS_LOCK_KEY_TEXT;
+  } else {
+    return nullptr;
+  }
+
+  const std::string &text = (*table)[(size_t)key_code];
+  return text.empty() ? nullptr : &text;
+}
 
 static bool pal_rewrite_is_busy() {
   return PAL_REWRITE_TRANSACTION_ACTIVE ||
@@ -263,6 +379,19 @@ static void copy_cg_event_text(PalInputEvent *input, CGEventRef event) {
       kCFAllocatorDefault,
       chars,
       actual_length);
+  CGEventFlags flags = CGEventGetFlags(event);
+  if ((flags & (kCGEventFlagMaskShift | kCGEventFlagMaskAlphaShift)) != 0 &&
+      actual_length == 1 && chars[0] < 128) {
+    const std::string *modified = modified_keyboard_layout_text(event);
+    if (modified != nullptr) {
+      CFRelease(string);
+      size_t length = std::min(modified->size(), sizeof(input->buffer) - 1);
+      memcpy(input->buffer, modified->data(), length);
+      input->buffer[length] = '\0';
+      input->buffer_len = length;
+      return;
+    }
+  }
   copy_string_to_input_buffer(input, string);
   CFRelease(string);
 }
@@ -977,15 +1106,12 @@ static void pal_render_candidate_panel(
   CGFloat preedit_width = MIN(MAX(preedit_size.width, 80.0), content_max_width);
 
   NSMutableArray<NSTextField *> *candidate_labels = [NSMutableArray array];
-  NSUInteger index = 1;
   for (NSString *candidate in candidates) {
-    NSString *display = [NSString stringWithFormat:@"%lu. %@", (unsigned long)index, candidate];
     NSTextField *label = pal_make_label(
-        display,
+        candidate,
         [NSFont systemFontOfSize:14.0 weight:NSFontWeightRegular],
         [NSColor labelColor]);
     [candidate_labels addObject:label];
-    index += 1;
   }
 
   if (candidate_labels.count == 0) {
@@ -1205,6 +1331,7 @@ extern "C" void pal_pinyin_start_event_loop(PalEventCallback callback) {
 
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+    pal_refresh_keyboard_layout();
 
     PAL_WORKSPACE_OBSERVER = [[[NSWorkspace sharedWorkspace] notificationCenter]
         addObserverForName:NSWorkspaceDidActivateApplicationNotification
@@ -1221,6 +1348,7 @@ extern "C" void pal_pinyin_start_event_loop(PalEventCallback callback) {
                      queue:[NSOperationQueue mainQueue]
                 usingBlock:^(NSNotification *notification) {
                   (void)notification;
+                  pal_refresh_keyboard_layout();
                   dispatch_context_event("keyboard_selection_changed");
                 }];
 

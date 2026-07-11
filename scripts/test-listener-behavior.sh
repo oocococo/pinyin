@@ -171,6 +171,9 @@ expected_punctuation="$(cargo run --quiet -- --body 'woyaoceshi,' | sed -n 's/^o
 expected_backspace="$(cargo run --quiet -- --body 'le' | sed -n 's/^output:[[:space:]]*//p')"
 expected_first_segment="$(cargo run --quiet -- --body 'woyao' | sed -n 's/^output:[[:space:]]*//p')"
 expected_second_segment="$(cargo run --quiet -- --body 'ceshi' | sed -n 's/^output:[[:space:]]*//p')"
+expected_ni="$(cargo run --quiet -- --body 'ni' | sed -n 's/^output:[[:space:]]*//p')"
+expected_shifted_punctuation="$(cargo run --quiet -- --body 'ni!' | sed -n 's/^output:[[:space:]]*//p')"
+expected_shi="$(cargo run --quiet -- --body 'shi' | sed -n 's/^output:[[:space:]]*//p')"
 
 cargo build --quiet
 
@@ -202,8 +205,14 @@ python3 - \
   "$expected_backspace" \
   "$expected_first_segment" \
   "$expected_second_segment" \
-  "$input_source_helper" <<'PY'
+  "$expected_ni" \
+  "$expected_shifted_punctuation" \
+  "$expected_shi" \
+  "$input_source_helper" \
+  "$listener_log" <<'PY'
+import json
 import os
+import pathlib
 import subprocess
 import sys
 import time
@@ -213,7 +222,11 @@ expected_punctuation = sys.argv[2]
 expected_backspace = sys.argv[3]
 expected_first_segment = sys.argv[4]
 expected_second_segment = sys.argv[5]
-input_source_helper = sys.argv[6]
+expected_ni = sys.argv[6]
+expected_shifted_punctuation = sys.argv[7]
+expected_shi = sys.argv[8]
+input_source_helper = sys.argv[9]
+listener_log = pathlib.Path(sys.argv[10])
 settle_seconds = float(os.environ.get("RIME_POC_BEHAVIOR_SETTLE_SECONDS", "10"))
 exit_backspaces = max(1, len(trigger_prefix))
 sentinel = "1234"
@@ -265,6 +278,20 @@ def wait_for(expected):
             return actual
         time.sleep(0.25)
 
+def wait_for_candidate_commit(page, index):
+    prefix = f"[listener] candidate page={page} index={index} commit "
+    deadline = time.monotonic() + settle_seconds
+    while True:
+        if listener_log.exists():
+            for line in reversed(listener_log.read_text(errors="replace").splitlines()):
+                if prefix in line and " output=" in line:
+                    return json.loads(line.rsplit(" output=", 1)[1])
+        if time.monotonic() >= deadline:
+            raise SystemExit(
+                f"candidate commit log did not appear for page={page} index={index}"
+            )
+        time.sleep(0.1)
+
 def type_text(value):
     script = r'''
 on run argv
@@ -305,7 +332,34 @@ end tell
 '''
     run_osascript(script)
 
+def press_shift():
+    script = r'''
+tell application "System Events"
+  tell process "TextEdit"
+    set frontmost to true
+  end tell
+  key down shift
+  delay 0.05
+  key up shift
+end tell
+'''
+    run_osascript(script)
+
+def type_shifted_one():
+    script = r'''
+tell application "System Events"
+  tell process "TextEdit"
+    set frontmost to true
+  end tell
+  key code 18 using {shift down}
+end tell
+'''
+    run_osascript(script)
+
 def start_session_after_sentinel():
+    time.sleep(0.5)
+    press_escape()
+    time.sleep(0.2)
     run_osascript(clear_script)
     select_abc()
     type_text(sentinel + trigger_prefix)
@@ -323,6 +377,103 @@ if actual != expected_punctuation:
         "punctuation separator case failed\n"
         f"expected: {expected_punctuation}\n"
         f"actual:   {actual}"
+    )
+
+start_session_after_sentinel()
+type_text("ni")
+press_shift()
+type_shifted_one()
+actual = wait_for(sentinel + expected_shifted_punctuation)
+if actual != sentinel + expected_shifted_punctuation:
+    raise SystemExit(
+        "Shift or Shift+1 interrupted the active session\n"
+        f"expected: {sentinel + expected_shifted_punctuation}\n"
+        f"actual:   {actual}"
+    )
+type_text("ni ")
+actual = wait_for(sentinel + expected_shifted_punctuation + expected_ni)
+if actual != sentinel + expected_shifted_punctuation + expected_ni:
+    raise SystemExit("session did not remain active after shifted punctuation")
+
+literal_text = "1=-`!"
+start_session_after_sentinel()
+type_text(literal_text)
+actual = wait_for(sentinel + literal_text)
+if actual != sentinel + literal_text:
+    raise SystemExit(
+        "special keys did not type normally outside pending pinyin\n"
+        f"expected: {sentinel + literal_text}\n"
+        f"actual:   {actual}"
+    )
+type_text("ni ")
+actual = wait_for(sentinel + literal_text + expected_ni)
+if actual != sentinel + literal_text + expected_ni:
+    raise SystemExit("ordinary literals polluted the candidate buffer or ended the session")
+
+no_candidate_literals = "vke-vke=vke1"
+start_session_after_sentinel()
+type_text(no_candidate_literals)
+actual = wait_for(sentinel + no_candidate_literals)
+if actual != sentinel + no_candidate_literals:
+    raise SystemExit(
+        "candidate/page keys did not stay ASCII when pending letters had no menu\n"
+        f"expected: {sentinel + no_candidate_literals}\n"
+        f"actual:   {actual}"
+    )
+type_text("ni ")
+actual = wait_for(sentinel + no_candidate_literals + expected_ni)
+if actual != sentinel + no_candidate_literals + expected_ni:
+    raise SystemExit("no-candidate literal fallback did not keep the session active")
+
+start_session_after_sentinel()
+type_text("hello")
+type_text("`")
+actual = wait_for(sentinel + "hello")
+if actual != sentinel + "hello":
+    raise SystemExit(
+        "English commit did not preserve raw pending text or consumed the wrong text\n"
+        f"expected: {sentinel + 'hello'}\n"
+        f"actual:   {actual}"
+    )
+type_text("ni ")
+actual = wait_for(sentinel + "hello" + expected_ni)
+if actual != sentinel + "hello" + expected_ni:
+    raise SystemExit("English commit did not keep the recognition session active")
+
+start_session_after_sentinel()
+type_text("shi1")
+actual = wait_for(sentinel + expected_shi)
+if actual != sentinel + expected_shi:
+    raise SystemExit(
+        "first candidate selection failed\n"
+        f"expected: {sentinel + expected_shi}\n"
+        f"actual:   {actual}"
+    )
+type_text("ni ")
+actual = wait_for(sentinel + expected_shi + expected_ni)
+if actual != sentinel + expected_shi + expected_ni:
+    raise SystemExit("candidate selection did not keep the recognition session active")
+
+start_session_after_sentinel()
+type_text("shi=-1")
+actual = wait_for(sentinel + expected_shi)
+if actual != sentinel + expected_shi:
+    raise SystemExit(
+        "candidate next/previous page round trip failed\n"
+        f"expected: {sentinel + expected_shi}\n"
+        f"actual:   {actual}"
+    )
+
+start_session_after_sentinel()
+type_text("shi=1")
+page_one_selection = wait_for_candidate_commit(1, 0)
+actual = wait_for(sentinel + page_one_selection)
+if actual != sentinel + page_one_selection or page_one_selection == expected_shi:
+    raise SystemExit(
+        "next-page candidate selection failed\n"
+        f"first-page candidate: {expected_shi}\n"
+        f"page-one candidate:  {page_one_selection}\n"
+        f"actual:              {actual}"
     )
 
 press_escape()
@@ -454,5 +605,26 @@ if actual != sentinel + "vkeabc":
         f"actual:   {actual}"
     )
 PY
+
+if ! grep -q "\[listener\] candidate page 0 -> 1" "$listener_log"; then
+  echo "candidate next-page transition was not logged" >&2
+  cat "$listener_log" >&2
+  exit 1
+fi
+if ! grep -q "\[listener\] candidate page 1 -> 0" "$listener_log"; then
+  echo "candidate previous-page transition was not logged" >&2
+  cat "$listener_log" >&2
+  exit 1
+fi
+if ! grep -q "\[listener\] candidate page=" "$listener_log"; then
+  echo "candidate commit was not logged" >&2
+  cat "$listener_log" >&2
+  exit 1
+fi
+if ! grep -q "\[listener\] english commit" "$listener_log"; then
+  echo "English commit was not logged" >&2
+  cat "$listener_log" >&2
+  exit 1
+fi
 
 echo "listener behavior test passed"

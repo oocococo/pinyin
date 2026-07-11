@@ -18,3 +18,12 @@ conversion_mode = "segmented"
 # Layout values: "horizontal" or "vertical".
 candidate_layout = "horizontal"
 candidate_count = 5
+
+# Candidate interaction keys. Number keys map to available candidate slots in
+# order. Selection and page keys are only captured while pending ASCII pinyin
+# has a candidate menu. The English key commits pending ASCII letters unchanged;
+# outside those states these characters are inserted normally.
+candidate_select_keys = "1234567890"
+candidate_page_next_key = "="
+candidate_page_previous_key = "-"
+english_commit_key = "`"

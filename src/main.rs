@@ -13,6 +13,8 @@ use rime_api::{
 };
 use serde::Deserialize;
 
+mod rime_direct;
+
 #[cfg(target_os = "macos")]
 mod mac;
 
@@ -21,9 +23,13 @@ const DEFAULT_TRIGGER: &str = ";;";
 const DEFAULT_MAX_BUFFER_CHARS: usize = 4096;
 const DEFAULT_INJECT_DELAY_MS: i32 = 1;
 const DEFAULT_CANDIDATE_COUNT: usize = 5;
+const DEFAULT_CANDIDATE_SELECT_KEYS: &str = "1234567890";
+const DEFAULT_CANDIDATE_PAGE_NEXT_KEY: &str = "=";
+const DEFAULT_CANDIDATE_PAGE_PREVIOUS_KEY: &str = "-";
+const DEFAULT_ENGLISH_COMMIT_KEY: &str = "`";
 const MIN_MAX_BUFFER_CHARS: usize = 16;
 const MIN_CANDIDATE_COUNT: usize = 1;
-const MAX_CANDIDATE_COUNT: usize = 20;
+const MAX_CANDIDATE_COUNT: usize = 10;
 
 #[cfg(target_os = "macos")]
 static LISTENER_RUNTIME: OnceLock<Mutex<ListenerRuntime>> = OnceLock::new();
@@ -51,6 +57,10 @@ struct AppConfig {
     conversion_mode: ConversionMode,
     candidate_layout: CandidateLayout,
     candidate_count: usize,
+    candidate_select_keys: String,
+    candidate_page_next_key: String,
+    candidate_page_previous_key: String,
+    english_commit_key: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -60,6 +70,10 @@ struct FileConfig {
     conversion_mode: Option<String>,
     candidate_layout: Option<String>,
     candidate_count: Option<usize>,
+    candidate_select_keys: Option<String>,
+    candidate_page_next_key: Option<String>,
+    candidate_page_previous_key: Option<String>,
+    english_commit_key: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -81,6 +95,14 @@ enum CandidateLayout {
     Vertical,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateInteractionKey {
+    Select(usize),
+    NextPage,
+    PreviousPage,
+    EnglishCommit,
+}
+
 #[derive(Debug)]
 struct ConvertedSegment {
     raw: String,
@@ -93,6 +115,8 @@ struct ConvertedSegment {
 struct CandidatePreview {
     preedit: String,
     candidates: Vec<String>,
+    page_no: usize,
+    is_last_page: bool,
 }
 
 #[derive(Debug)]
@@ -107,6 +131,7 @@ struct ConversionOutput {
 enum CaptureAction {
     StartSession(StartSessionAction),
     Convert(ConversionAction),
+    InsertLiteral(InsertLiteralAction),
     EndSession(EndSessionAction),
 }
 
@@ -123,6 +148,18 @@ struct ConversionAction {
     restore_text: String,
     delete_chars: usize,
     stay_active: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct InsertLiteralAction {
+    text: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PendingCommitAction {
+    original_text: String,
+    replacement_text: String,
+    delete_chars: usize,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -218,6 +255,7 @@ struct CaptureState {
     mode: CaptureMode,
     committed_output_chars: usize,
     hidden_prefix_backspaces_remaining: usize,
+    candidate_page: usize,
     last_conversion: Option<ReversibleConversion>,
 }
 
@@ -418,7 +456,33 @@ impl Default for AppConfig {
             conversion_mode: ConversionMode::Segmented,
             candidate_layout: CandidateLayout::Horizontal,
             candidate_count: DEFAULT_CANDIDATE_COUNT,
+            candidate_select_keys: DEFAULT_CANDIDATE_SELECT_KEYS.to_owned(),
+            candidate_page_next_key: DEFAULT_CANDIDATE_PAGE_NEXT_KEY.to_owned(),
+            candidate_page_previous_key: DEFAULT_CANDIDATE_PAGE_PREVIOUS_KEY.to_owned(),
+            english_commit_key: DEFAULT_ENGLISH_COMMIT_KEY.to_owned(),
         }
+    }
+}
+
+impl AppConfig {
+    fn candidate_interaction_key(&self, key: char) -> Option<CandidateInteractionKey> {
+        if self.english_commit_key.starts_with(key) {
+            return Some(CandidateInteractionKey::EnglishCommit);
+        }
+        if let Some(index) = self
+            .candidate_select_keys
+            .chars()
+            .position(|candidate_key| candidate_key == key)
+        {
+            return Some(CandidateInteractionKey::Select(index));
+        }
+        if self.candidate_page_next_key.starts_with(key) {
+            return Some(CandidateInteractionKey::NextPage);
+        }
+        if self.candidate_page_previous_key.starts_with(key) {
+            return Some(CandidateInteractionKey::PreviousPage);
+        }
+        None
     }
 }
 
@@ -504,6 +568,18 @@ fn load_config(config_path: Option<PathBuf>) -> Result<(AppConfig, Option<PathBu
             candidate_count: file_config
                 .candidate_count
                 .unwrap_or(defaults.candidate_count),
+            candidate_select_keys: file_config
+                .candidate_select_keys
+                .unwrap_or(defaults.candidate_select_keys),
+            candidate_page_next_key: file_config
+                .candidate_page_next_key
+                .unwrap_or(defaults.candidate_page_next_key),
+            candidate_page_previous_key: file_config
+                .candidate_page_previous_key
+                .unwrap_or(defaults.candidate_page_previous_key),
+            english_commit_key: file_config
+                .english_commit_key
+                .unwrap_or(defaults.english_commit_key),
         },
         Some(path),
     ))
@@ -517,7 +593,81 @@ fn packaged_config_file() -> Option<PathBuf> {
 fn validate_config(config: &AppConfig) -> Result<()> {
     validate_trigger_part("trigger_prefix", &config.trigger_prefix)?;
     validate_trigger_part("trigger_suffix", &config.trigger_suffix)?;
+    validate_interaction_keys(config)?;
     Ok(())
+}
+
+fn validate_interaction_keys(config: &AppConfig) -> Result<()> {
+    let select_keys = config.candidate_select_keys.chars().collect::<Vec<_>>();
+    if select_keys.is_empty() {
+        bail!("candidate_select_keys must not be empty");
+    }
+    if select_keys.iter().any(|key| !key.is_ascii_digit()) {
+        bail!("candidate_select_keys must contain only ASCII digits");
+    }
+
+    let mut unique_select_keys = select_keys.clone();
+    unique_select_keys.sort_unstable();
+    unique_select_keys.dedup();
+    if unique_select_keys.len() != select_keys.len() {
+        bail!("candidate_select_keys must not contain duplicate digits");
+    }
+    if config.candidate_count > select_keys.len() {
+        bail!(
+            "candidate_count ({}) exceeds candidate_select_keys capacity ({})",
+            config.candidate_count,
+            select_keys.len()
+        );
+    }
+
+    let page_next =
+        parse_interaction_key("candidate_page_next_key", &config.candidate_page_next_key)?;
+    let page_previous = parse_interaction_key(
+        "candidate_page_previous_key",
+        &config.candidate_page_previous_key,
+    )?;
+    let english_commit = parse_interaction_key("english_commit_key", &config.english_commit_key)?;
+    let named_keys = [
+        ("candidate_page_next_key", page_next),
+        ("candidate_page_previous_key", page_previous),
+        ("english_commit_key", english_commit),
+    ];
+
+    for (name, key) in named_keys {
+        if is_pinyin_char(key) {
+            bail!("{name} must not be an ASCII pinyin character: {key:?}");
+        }
+        if select_keys.contains(&key) {
+            bail!("{name} conflicts with candidate_select_keys: {key:?}");
+        }
+        if config.trigger_prefix.contains(key) || config.trigger_suffix.contains(key) {
+            bail!("{name} conflicts with a trigger character: {key:?}");
+        }
+    }
+
+    if page_next == page_previous || page_next == english_commit || page_previous == english_commit
+    {
+        bail!("candidate page keys and english_commit_key must be distinct");
+    }
+
+    for key in select_keys {
+        if config.trigger_prefix.contains(key) || config.trigger_suffix.contains(key) {
+            bail!("candidate_select_keys conflicts with a trigger character: {key:?}");
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_interaction_key(name: &str, value: &str) -> Result<char> {
+    let mut chars = value.chars();
+    let Some(key) = chars.next() else {
+        bail!("{name} must contain exactly one character");
+    };
+    if chars.next().is_some() || key.is_control() {
+        bail!("{name} must contain exactly one printable character");
+    }
+    Ok(key)
 }
 
 fn validate_runtime_options(
@@ -622,9 +772,12 @@ fn ensure_body_has_pinyin(body: &str) -> Result<()> {
 }
 
 fn body_has_pinyin(body: &str) -> bool {
-    tokenize_body(body)
-        .iter()
-        .any(|token| matches!(token, Token::Pinyin(_)))
+    tokenize_body(body).iter().any(|token| {
+        matches!(
+            token,
+            Token::Pinyin(value) if value.chars().any(|ch| ch.is_ascii_alphabetic())
+        )
+    })
 }
 
 fn run_conversion(options: &Options, body: String) -> Result<()> {
@@ -649,6 +802,22 @@ fn run_conversion(options: &Options, body: String) -> Result<()> {
         options.config.candidate_layout.as_str()
     );
     println!("candidate_count: {}", options.config.candidate_count);
+    println!(
+        "candidate_select_keys: {:?}",
+        options.config.candidate_select_keys
+    );
+    println!(
+        "candidate_page_next_key: {:?}",
+        options.config.candidate_page_next_key
+    );
+    println!(
+        "candidate_page_previous_key: {:?}",
+        options.config.candidate_page_previous_key
+    );
+    println!(
+        "english_commit_key: {:?}",
+        options.config.english_commit_key
+    );
     match &options.config_path {
         Some(path) => println!("config:          {}", path.display()),
         None => println!("config:          <defaults>"),
@@ -728,6 +897,22 @@ fn run_listener(options: Options) -> Result<()> {
     println!(
         "candidate_count: {}",
         runtime.options.config.candidate_count
+    );
+    println!(
+        "candidate_select_keys: {:?}",
+        runtime.options.config.candidate_select_keys
+    );
+    println!(
+        "candidate_page_next_key: {:?}",
+        runtime.options.config.candidate_page_next_key
+    );
+    println!(
+        "candidate_page_previous_key: {:?}",
+        runtime.options.config.candidate_page_previous_key
+    );
+    println!(
+        "english_commit_key: {:?}",
+        runtime.options.config.english_commit_key
     );
     println!("max_buffer_chars: {}", runtime.options.max_buffer_chars);
     println!("inject_delay_ms: {}", runtime.options.inject_delay_ms);
@@ -1014,6 +1199,7 @@ impl CaptureState {
             mode: CaptureMode::Idle,
             committed_output_chars: 0,
             hidden_prefix_backspaces_remaining: 0,
+            candidate_page: 0,
             last_conversion: None,
         }
     }
@@ -1040,6 +1226,7 @@ impl CaptureState {
 
     fn append_text_without_actions(&mut self, text: &str, visible: bool) {
         self.last_conversion = None;
+        self.candidate_page = 0;
         for ch in text.chars().filter(|ch| !ch.is_control()) {
             self.buffer.push(ch);
             self.buffer_visible.push(visible);
@@ -1052,9 +1239,13 @@ impl CaptureState {
         self.append_text_without_actions(text, visible);
     }
 
-    fn will_rewrite_after_text(&self, text: &str) -> bool {
+    fn will_rewrite_after_text(&self, text: &str, visible: bool) -> bool {
         let mut next = self.clone();
-        next.push_text(text).is_some()
+        if visible {
+            next.push_text(text).is_some()
+        } else {
+            next.push_text_with_visibility(text, false).is_some()
+        }
     }
 
     fn is_active(&self) -> bool {
@@ -1109,6 +1300,7 @@ impl CaptureState {
                     self.mode = CaptureMode::Active;
                     self.committed_output_chars = 0;
                     self.hidden_prefix_backspaces_remaining = self.active_exit_backspace_count();
+                    self.candidate_page = 0;
                     self.last_conversion = None;
                     return Some(CaptureAction::StartSession(StartSessionAction {
                         trigger_text,
@@ -1126,6 +1318,8 @@ impl CaptureState {
                     return self.try_incremental_conversion();
                 }
 
+                self.candidate_page = 0;
+
                 None
             }
         }
@@ -1133,6 +1327,7 @@ impl CaptureState {
 
     fn backspace(&mut self) {
         self.last_conversion = None;
+        self.candidate_page = 0;
         if self.buffer.pop().is_some() {
             self.buffer_visible.pop();
             return;
@@ -1158,6 +1353,7 @@ impl CaptureState {
 
     fn delete_previous_word(&mut self) -> DeletePreviousWordOutcome {
         self.last_conversion = None;
+        self.candidate_page = 0;
         let mut outcome = DeletePreviousWordOutcome {
             removed_chars: 0,
             removed_visible_chars: 0,
@@ -1186,6 +1382,7 @@ impl CaptureState {
         self.mode = CaptureMode::Idle;
         self.committed_output_chars = 0;
         self.hidden_prefix_backspaces_remaining = 0;
+        self.candidate_page = 0;
         self.last_conversion = None;
     }
 
@@ -1205,6 +1402,13 @@ impl CaptureState {
         });
     }
 
+    fn record_committed_literal(&mut self, text: &str) {
+        self.committed_output_chars = self
+            .committed_output_chars
+            .saturating_add(text.chars().count());
+        self.last_conversion = None;
+    }
+
     fn restore_last_conversion(&mut self, host_backspace_applied: bool) -> Option<RestoreAction> {
         let conversion = self.last_conversion.take()?;
         let inserted_chars = conversion.inserted_text.chars().count();
@@ -1214,6 +1418,7 @@ impl CaptureState {
         self.buffer = conversion.original_text.clone();
         self.buffer_visible = vec![true; conversion.original_text.chars().count()];
         self.mode = CaptureMode::Active;
+        self.candidate_page = 0;
         let replacement_text = conversion.original_text.clone();
 
         Some(RestoreAction {
@@ -1250,6 +1455,7 @@ impl CaptureState {
         self.mode = CaptureMode::Idle;
         self.committed_output_chars = 0;
         self.hidden_prefix_backspaces_remaining = 0;
+        self.candidate_page = 0;
         self.last_conversion = None;
 
         if body_has_pinyin(&body) {
@@ -1274,13 +1480,30 @@ impl CaptureState {
         let body = self.active_body_from(&typed_text);
         let body = trim_commit_only_whitespace(&body).to_owned();
         if !body_has_pinyin(&body) {
-            return None;
+            let invisible_text = self
+                .buffer
+                .chars()
+                .zip(self.buffer_visible.iter().copied())
+                .filter_map(|(ch, visible)| (!visible).then_some(ch))
+                .collect::<String>();
+            self.committed_output_chars = self
+                .committed_output_chars
+                .saturating_add(self.buffer.chars().count());
+            self.buffer.clear();
+            self.buffer_visible.clear();
+            self.candidate_page = 0;
+            return (!invisible_text.is_empty()).then_some(CaptureAction::InsertLiteral(
+                InsertLiteralAction {
+                    text: invisible_text,
+                },
+            ));
         }
 
         let delete_chars = self.current_segment_delete_chars();
         self.buffer.clear();
         self.buffer_visible.clear();
         self.mode = CaptureMode::Active;
+        self.candidate_page = 0;
         self.last_conversion = None;
 
         Some(CaptureAction::Convert(ConversionAction {
@@ -1302,6 +1525,37 @@ impl CaptureState {
         } else {
             String::new()
         }
+    }
+
+    fn pending_pinyin(&self) -> Option<String> {
+        if !self.is_active()
+            || self.buffer.is_empty()
+            || !self.buffer.chars().all(is_pinyin_char)
+            || !self.buffer.chars().any(|ch| ch.is_ascii_alphabetic())
+        {
+            return None;
+        }
+
+        Some(self.buffer.clone())
+    }
+
+    fn take_pending_commit(&mut self, replacement_text: String) -> Option<PendingCommitAction> {
+        let original_text = self.pending_pinyin()?;
+        let delete_chars = self.current_segment_delete_chars();
+        self.buffer.clear();
+        self.buffer_visible.clear();
+        self.candidate_page = 0;
+        self.last_conversion = None;
+
+        Some(PendingCommitAction {
+            original_text,
+            replacement_text,
+            delete_chars,
+        })
+    }
+
+    fn set_candidate_page(&mut self, page_no: usize) {
+        self.candidate_page = page_no;
     }
 
     fn is_commit_separator(&self, ch: char) -> bool {
@@ -1384,11 +1638,6 @@ impl ListenerRuntime {
             return Ok(false);
         }
 
-        if matches!(event.key_code, mac::KEY_SHIFT_LEFT | mac::KEY_SHIFT_RIGHT) {
-            self.clear_capture_context("shift key");
-            return Ok(false);
-        }
-
         if event.has_command_modifier() && matches!(event.key_code, mac::KEY_TAB | mac::KEY_GRAVE) {
             self.clear_capture_context("window switch shortcut");
             return Ok(false);
@@ -1456,9 +1705,13 @@ impl ListenerRuntime {
             return Ok(false);
         }
 
+        if let Some(consume) = self.handle_candidate_interaction(&text)? {
+            return Ok(consume);
+        }
+
         let was_active = self.capture.is_active();
         let visible = !event.is_buffered_replay();
-        let will_rewrite = self.capture.will_rewrite_after_text(&text);
+        let will_rewrite = self.capture.will_rewrite_after_text(&text, visible);
         let rewrite_recovery = will_rewrite.then(|| {
             (
                 self.capture.clone(),
@@ -1640,10 +1893,176 @@ impl ListenerRuntime {
         Ok(false)
     }
 
+    fn handle_candidate_interaction(&mut self, text: &str) -> Result<Option<bool>> {
+        let mut chars = text.chars();
+        let Some(key) = chars.next() else {
+            return Ok(None);
+        };
+        if chars.next().is_some() {
+            return Ok(None);
+        }
+
+        let Some(pending) = self.capture.pending_pinyin() else {
+            return Ok(None);
+        };
+
+        let Some(interaction) = self.options.config.candidate_interaction_key(key) else {
+            return Ok(None);
+        };
+
+        if interaction == CandidateInteractionKey::EnglishCommit {
+            return match self.commit_pending_text(pending, "english") {
+                Ok(()) => Ok(Some(true)),
+                Err(error) => {
+                    eprintln!(
+                        "listener English commit error; falling back to literal key: {error:#}"
+                    );
+                    Ok(None)
+                }
+            };
+        }
+
+        let current = match preview_candidates(
+            &self.options,
+            &pending,
+            self.options.config.candidate_count,
+            self.capture.candidate_page,
+        ) {
+            Ok(preview) => preview,
+            Err(error) => {
+                eprintln!("listener candidate interaction preview error: {error:#}");
+                return Ok(None);
+            }
+        };
+        if current.candidates.is_empty() {
+            let replacement = format!("{pending}{key}");
+            return match self.commit_pending_literal_text(replacement, "no-candidate literal") {
+                Ok(()) => Ok(Some(true)),
+                Err(error) => {
+                    eprintln!(
+                        "listener no-candidate literal commit error; falling back to ordinary key: {error:#}"
+                    );
+                    Ok(None)
+                }
+            };
+        }
+
+        if let CandidateInteractionKey::Select(index) = interaction {
+            if index >= current.candidates.len() {
+                return Ok(None);
+            }
+            let selected = match select_candidate(&self.options, &pending, current.page_no, index) {
+                Ok(Some(selected)) => selected,
+                Ok(None) => return Ok(None),
+                Err(error) => {
+                    eprintln!(
+                        "listener candidate selection error; falling back to literal key: {error:#}"
+                    );
+                    return Ok(None);
+                }
+            };
+            let kind = format!("candidate page={} index={index}", current.page_no);
+            return match self.commit_pending_text(selected, &kind) {
+                Ok(()) => Ok(Some(true)),
+                Err(error) => {
+                    eprintln!(
+                        "listener candidate commit error; falling back to literal key: {error:#}"
+                    );
+                    Ok(None)
+                }
+            };
+        }
+
+        let target_page = match interaction {
+            CandidateInteractionKey::NextPage => current.page_no.saturating_add(1),
+            CandidateInteractionKey::PreviousPage => current.page_no.saturating_sub(1),
+            CandidateInteractionKey::Select(_) | CandidateInteractionKey::EnglishCommit => {
+                unreachable!("selection and English commit returned above")
+            }
+        };
+        if (interaction == CandidateInteractionKey::NextPage && current.is_last_page)
+            || (interaction == CandidateInteractionKey::PreviousPage && current.page_no == 0)
+        {
+            if let Err(error) = self.show_candidate_preview(&current) {
+                eprintln!("listener candidate boundary preview error: {error:#}");
+            }
+            return Ok(Some(true));
+        }
+
+        let target = match preview_candidates(
+            &self.options,
+            &pending,
+            self.options.config.candidate_count,
+            target_page,
+        ) {
+            Ok(target) => target,
+            Err(error) => {
+                eprintln!("listener candidate page error; falling back to literal key: {error:#}");
+                return Ok(None);
+            }
+        };
+        self.capture.set_candidate_page(target.page_no);
+        println!(
+            "[listener] candidate page {} -> {}",
+            current.page_no, target.page_no
+        );
+        if let Err(error) = self.show_candidate_preview(&target) {
+            eprintln!("listener candidate page preview error: {error:#}");
+        }
+        Ok(Some(true))
+    }
+
+    fn commit_pending_text(&mut self, replacement_text: String, kind: &str) -> Result<()> {
+        let previous = self.capture.clone();
+        let Some(action) = self.capture.take_pending_commit(replacement_text) else {
+            return Ok(());
+        };
+        let quote_state_before = self.quote_state;
+
+        if let Err(error) = self.perform_rewrite(action.delete_chars, &action.replacement_text) {
+            self.capture = previous;
+            return Err(error);
+        }
+
+        println!(
+            "[listener] {kind} commit delete_chars={} raw={:?} output={:?}",
+            action.delete_chars, action.original_text, action.replacement_text
+        );
+        self.capture.record_conversion(
+            action.original_text,
+            action.replacement_text,
+            quote_state_before,
+        );
+        self.refresh_candidate_panel_best_effort(kind);
+        Ok(())
+    }
+
+    fn commit_pending_literal_text(&mut self, replacement_text: String, kind: &str) -> Result<()> {
+        let previous = self.capture.clone();
+        let Some(action) = self.capture.take_pending_commit(replacement_text) else {
+            return Ok(());
+        };
+
+        if let Err(error) = self.perform_rewrite(action.delete_chars, &action.replacement_text) {
+            self.capture = previous;
+            return Err(error);
+        }
+
+        println!(
+            "[listener] {kind} delete_chars={} raw={:?} output={:?}",
+            action.delete_chars, action.original_text, action.replacement_text
+        );
+        self.capture
+            .record_committed_literal(&action.replacement_text);
+        self.refresh_candidate_panel_best_effort(kind);
+        Ok(())
+    }
+
     fn handle_action(&mut self, action: CaptureAction) -> Result<()> {
         match action {
             CaptureAction::StartSession(action) => self.handle_start_session(action),
             CaptureAction::Convert(action) => self.handle_conversion(action),
+            CaptureAction::InsertLiteral(action) => self.handle_literal_insertion(action),
             CaptureAction::EndSession(action) => {
                 self.quote_state = QuoteState::default();
                 self.session_input_source = None;
@@ -1666,6 +2085,12 @@ impl ListenerRuntime {
         );
         self.perform_rewrite(action.delete_chars, "")?;
         self.refresh_candidate_panel_best_effort("session start");
+        Ok(())
+    }
+
+    fn handle_literal_insertion(&mut self, action: InsertLiteralAction) -> Result<()> {
+        self.perform_rewrite(0, &action.text)?;
+        self.refresh_candidate_panel_best_effort("buffered literal replay");
         Ok(())
     }
 
@@ -1778,10 +2203,23 @@ impl ListenerRuntime {
             &self.options,
             &self.capture.active_preview_body(),
             self.options.config.candidate_count,
+            self.capture.candidate_page,
         )?;
+        self.show_candidate_preview(&preview)
+    }
+
+    fn show_candidate_preview(&self, preview: &CandidatePreview) -> Result<()> {
+        let candidates = self
+            .options
+            .config
+            .candidate_select_keys
+            .chars()
+            .zip(preview.candidates.iter())
+            .map(|(key, candidate)| format!("{key}. {candidate}"))
+            .collect::<Vec<_>>();
         mac::update_candidate_panel(
             &preview.preedit,
-            &preview.candidates,
+            &candidates,
             self.options.config.candidate_layout,
         )?;
         Ok(())
@@ -1827,44 +2265,30 @@ fn preview_candidates(
     options: &Options,
     body: &str,
     candidate_count: usize,
+    requested_page: usize,
 ) -> Result<CandidatePreview> {
-    let raw = pending_pinyin_for_preview(body);
-    if raw.is_empty() {
+    let Some((mut session, raw)) = open_candidate_session(options, body, requested_page)? else {
         return Ok(CandidatePreview {
             preedit: "Rime active".to_owned(),
             candidates: Vec::new(),
+            page_no: 0,
+            is_last_page: true,
         });
-    }
+    };
 
-    let normalized = normalize_pinyin_run(&raw);
-    if !normalized.chars().any(|ch| ch.is_ascii_alphanumeric()) {
-        return Ok(CandidatePreview {
-            preedit: raw,
-            candidates: Vec::new(),
-        });
-    }
-
-    let mut session = create_selected_session(&options.schema)?;
-    for ch in normalized.chars() {
-        let status = session.process_key(KeyEvent::new(ch as u32, 0));
-        if matches!(status, KeyStatus::Pass) {
-            session.close().context("failed to close Rime session")?;
-            return Ok(CandidatePreview {
-                preedit: raw,
-                candidates: Vec::new(),
-            });
-        }
-    }
-
-    let mut preedit = normalized.clone();
+    let mut preedit = raw.clone();
     let mut candidates = Vec::new();
+    let mut page_no = 0;
+    let mut is_last_page = true;
     if let Some(context) = session.context() {
         let composition = context.composition();
         if let Some(value) = composition.preedit {
             preedit = value.to_owned();
         }
-        candidates = context
-            .menu()
+        let menu = context.menu();
+        page_no = menu.page_no;
+        is_last_page = menu.is_last_page;
+        candidates = menu
             .candidates
             .iter()
             .take(candidate_count)
@@ -1876,7 +2300,76 @@ fn preview_candidates(
     Ok(CandidatePreview {
         preedit,
         candidates,
+        page_no,
+        is_last_page,
     })
+}
+
+fn open_candidate_session(
+    options: &Options,
+    body: &str,
+    requested_page: usize,
+) -> Result<Option<(Session, String)>> {
+    let raw = pending_pinyin_for_preview(body);
+    if raw.is_empty() {
+        return Ok(None);
+    }
+
+    let normalized = normalize_pinyin_run(&raw);
+    if !normalized.chars().any(|ch| ch.is_ascii_alphabetic()) {
+        return Ok(None);
+    }
+
+    let mut session = create_selected_session(&options.schema)?;
+    for ch in normalized.chars() {
+        let status = session.process_key(KeyEvent::new(ch as u32, 0));
+        if matches!(status, KeyStatus::Pass) {
+            session.close().context("failed to close Rime session")?;
+            return Ok(None);
+        }
+    }
+
+    for _ in 0..requested_page {
+        if !rime_direct::change_page(session.session_id, false)? {
+            break;
+        }
+    }
+
+    Ok(Some((session, raw)))
+}
+
+fn select_candidate(
+    options: &Options,
+    body: &str,
+    page_no: usize,
+    index: usize,
+) -> Result<Option<String>> {
+    let Some((mut session, _)) = open_candidate_session(options, body, page_no)? else {
+        return Ok(None);
+    };
+
+    let selected_text = session.context().and_then(|context| {
+        context
+            .menu()
+            .candidates
+            .get(index)
+            .map(|candidate| candidate.text.to_owned())
+    });
+    let Some(selected_text) = selected_text else {
+        session.close().context("failed to close Rime session")?;
+        return Ok(None);
+    };
+
+    if !rime_direct::select_candidate_on_current_page(session.session_id, index)? {
+        session.close().context("failed to close Rime session")?;
+        return Ok(None);
+    }
+    let committed_text = session
+        .commit()
+        .map(|commit| commit.text().to_owned())
+        .unwrap_or(selected_text);
+    session.close().context("failed to close Rime session")?;
+    Ok(Some(committed_text))
 }
 
 fn pending_pinyin_for_preview(body: &str) -> String {
@@ -1884,9 +2377,7 @@ fn pending_pinyin_for_preview(body: &str) -> String {
         .into_iter()
         .rev()
         .find_map(|token| match token {
-            Token::Pinyin(value) if value.chars().any(|ch| ch.is_ascii_alphanumeric()) => {
-                Some(value)
-            }
+            Token::Pinyin(value) if value.chars().any(|ch| ch.is_ascii_alphabetic()) => Some(value),
             _ => None,
         })
         .unwrap_or_default()
@@ -1995,13 +2486,13 @@ fn flush_pinyin(tokens: &mut Vec<Token>, pinyin: &mut String) {
 fn normalize_pinyin_run(input: &str) -> String {
     input
         .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '\'')
+        .filter(|ch| ch.is_ascii_alphabetic() || *ch == '\'')
         .map(|ch| ch.to_ascii_lowercase())
         .collect()
 }
 
 fn is_pinyin_char(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || ch == '\''
+    ch.is_ascii_alphabetic() || ch == '\''
 }
 
 fn is_reserved_separator(ch: char) -> bool {
@@ -2083,6 +2574,22 @@ fn print_doctor(options: &Options) {
         options.config.candidate_layout.as_str()
     );
     println!("candidate_count: {}", options.config.candidate_count);
+    println!(
+        "candidate_select_keys: {:?}",
+        options.config.candidate_select_keys
+    );
+    println!(
+        "candidate_page_next_key: {:?}",
+        options.config.candidate_page_next_key
+    );
+    println!(
+        "candidate_page_previous_key: {:?}",
+        options.config.candidate_page_previous_key
+    );
+    println!(
+        "english_commit_key: {:?}",
+        options.config.english_commit_key
+    );
     println!("body_mode:       {}", options.body_mode);
     println!("listen:          {}", options.listen);
     println!("max_buffer_chars: {}", options.max_buffer_chars);
@@ -2145,7 +2652,7 @@ Options:\n  \
 --config <FILE>          Trigger config file [env: RIME_POC_CONFIG] [default: ./rime-poc.toml if present]\n  \
 --conversion-mode <MODE> Conversion mode: segmented or rime-auto [env: RIME_POC_CONVERSION_MODE]\n  \
 --candidate-layout <LAYOUT> Candidate layout: horizontal or vertical [env: RIME_POC_CANDIDATE_LAYOUT] [default: horizontal]\n  \
---candidate-count <N>    Candidate count shown in the UI, 1-20 [env: RIME_POC_CANDIDATE_COUNT] [default: 5]\n  \
+--candidate-count <N>    Candidate count shown in the UI, 1-10 [env: RIME_POC_CANDIDATE_COUNT] [default: 5]\n  \
 --listen                 Start macOS global listener mode\n  \
 --log-events             Print every key/mouse event seen by the listener [env: RIME_POC_LOG_EVENTS]\n  \
 --body                   Treat input as body text without requiring trigger prefix/suffix\n  \
@@ -2179,9 +2686,7 @@ mod tests {
         let config = AppConfig {
             trigger_prefix: "[[".to_owned(),
             trigger_suffix: "]]".to_owned(),
-            conversion_mode: ConversionMode::Segmented,
-            candidate_layout: CandidateLayout::Horizontal,
-            candidate_count: DEFAULT_CANDIDATE_COUNT,
+            ..AppConfig::default()
         };
 
         let body = extract_body("[[woyaoceshi]]", &config, false).unwrap();
@@ -2194,9 +2699,7 @@ mod tests {
         let config = AppConfig {
             trigger_prefix: ";;".to_owned(),
             trigger_suffix: "?".to_owned(),
-            conversion_mode: ConversionMode::Segmented,
-            candidate_layout: CandidateLayout::Horizontal,
-            candidate_count: DEFAULT_CANDIDATE_COUNT,
+            ..AppConfig::default()
         };
 
         let error = validate_config(&config).unwrap_err().to_string();
@@ -2206,9 +2709,7 @@ mod tests {
         let config = AppConfig {
             trigger_prefix: "!".to_owned(),
             trigger_suffix: ";;".to_owned(),
-            conversion_mode: ConversionMode::Segmented,
-            candidate_layout: CandidateLayout::Horizontal,
-            candidate_count: DEFAULT_CANDIDATE_COUNT,
+            ..AppConfig::default()
         };
 
         let error = validate_config(&config).unwrap_err().to_string();
@@ -2282,7 +2783,7 @@ mod tests {
         let mut capture = test_capture_state();
         capture.push_text(";;");
 
-        assert!(capture.will_rewrite_after_text("woyaoceshi "));
+        assert!(capture.will_rewrite_after_text("woyaoceshi ", true));
         let action = capture.push_text("woyaoceshi ");
 
         assert_eq!(
@@ -2384,12 +2885,144 @@ mod tests {
         let mut capture = test_capture_state();
         capture.push_text(";;");
 
-        assert!(!capture.will_rewrite_after_text("woyaoceshi;"));
+        assert!(!capture.will_rewrite_after_text("woyaoceshi;", true));
         let action = capture.push_text("woyaoceshi;");
 
         assert_eq!(action, None);
         assert_eq!(capture.mode, CaptureMode::Active);
         assert_eq!(capture.buffer, "woyaoceshi;");
+    }
+
+    #[test]
+    fn non_pinyin_literals_do_not_enter_an_empty_active_buffer() {
+        let mut capture = test_capture_state();
+        capture.push_text(";;");
+
+        for literal in ["1", "=", "-", "`", "!"] {
+            assert_eq!(capture.push_text(literal), None);
+            assert!(
+                capture.buffer.is_empty(),
+                "literal {literal:?} must stay outside the candidate buffer"
+            );
+        }
+
+        assert!(!is_pinyin_char('1'));
+        assert!(is_pinyin_char('n'));
+        assert!(is_pinyin_char('\''));
+    }
+
+    #[test]
+    fn shifted_punctuation_converts_pending_pinyin() {
+        let mut capture = test_capture_state();
+        capture.push_text(";;ni");
+
+        let action = capture.push_text("!");
+
+        assert!(matches!(
+            action,
+            Some(CaptureAction::Convert(ConversionAction { body, .. })) if body == "ni!"
+        ));
+    }
+
+    #[test]
+    fn candidate_commit_clears_pending_text_and_resets_page() {
+        let mut capture = test_capture_state();
+        capture.push_text(";;ni");
+        capture.set_candidate_page(2);
+
+        let action = capture.take_pending_commit("你".to_owned());
+
+        assert_eq!(
+            action,
+            Some(PendingCommitAction {
+                original_text: "ni".to_owned(),
+                replacement_text: "你".to_owned(),
+                delete_chars: 2,
+            })
+        );
+        assert!(capture.buffer.is_empty());
+        assert_eq!(capture.candidate_page, 0);
+        assert!(capture.is_active());
+    }
+
+    #[test]
+    fn english_commit_keeps_raw_pending_text() {
+        let mut capture = test_capture_state();
+        capture.push_text(";;hello");
+
+        let action = capture.take_pending_commit("hello".to_owned()).unwrap();
+        capture.record_conversion(
+            action.original_text,
+            action.replacement_text,
+            QuoteState::default(),
+        );
+
+        assert_eq!(capture.committed_output_chars, 5);
+        assert_eq!(capture.last_conversion, None);
+        assert!(capture.is_active());
+    }
+
+    #[test]
+    fn invalid_pinyin_followed_by_digit_commits_as_raw_literal_text() {
+        let mut capture = test_capture_state();
+        capture.push_text(";;vke");
+
+        let action = capture.push_text("1");
+
+        assert!(matches!(
+            action,
+            Some(CaptureAction::Convert(ConversionAction { body, .. })) if body == "vke1"
+        ));
+        assert!(capture.buffer.is_empty());
+    }
+
+    #[test]
+    fn no_candidate_control_key_can_be_recorded_as_raw_literal_output() {
+        let mut capture = test_capture_state();
+        capture.push_text(";;vke");
+
+        let action = capture.take_pending_commit("vke-".to_owned()).unwrap();
+        capture.record_committed_literal(&action.replacement_text);
+
+        assert_eq!(action.delete_chars, 3);
+        assert_eq!(capture.committed_output_chars, 4);
+        assert_eq!(capture.last_conversion, None);
+        assert!(capture.buffer.is_empty());
+        assert!(capture.is_active());
+    }
+
+    #[test]
+    fn buffered_literal_outside_pending_pinyin_is_reinjected() {
+        let mut capture = test_capture_state();
+        capture.push_text(";;");
+
+        let action = capture.push_text_with_visibility("1", false);
+
+        assert_eq!(
+            action,
+            Some(CaptureAction::InsertLiteral(InsertLiteralAction {
+                text: "1".to_owned(),
+            }))
+        );
+        assert!(capture.buffer.is_empty());
+        assert_eq!(capture.committed_output_chars, 1);
+    }
+
+    #[test]
+    fn visible_literal_deletion_preserves_hidden_prefix_budget() {
+        let mut capture = test_capture_state();
+        capture.push_text(";;");
+
+        assert_eq!(capture.push_text("1"), None);
+        assert_eq!(capture.committed_output_chars, 1);
+        assert_eq!(capture.hidden_prefix_backspaces_remaining, 2);
+
+        capture.backspace();
+
+        assert!(capture.is_active());
+        assert_eq!(capture.committed_output_chars, 0);
+        assert_eq!(capture.hidden_prefix_backspaces_remaining, 2);
+        assert!(capture.should_consume_backspace());
     }
 
     #[test]
@@ -2859,5 +3492,218 @@ mod tests {
         assert!(validate_runtime_options(128, 0, DEFAULT_CANDIDATE_COUNT).is_ok());
         assert!(validate_runtime_options(128, 0, 0).is_err());
         assert!(validate_runtime_options(128, 0, MAX_CANDIDATE_COUNT + 1).is_err());
+    }
+
+    #[test]
+    fn validates_candidate_interaction_keys() {
+        assert!(validate_config(&AppConfig::default()).is_ok());
+
+        let config = AppConfig {
+            candidate_select_keys: "112".to_owned(),
+            ..AppConfig::default()
+        };
+        assert!(validate_config(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate"));
+
+        let config = AppConfig {
+            candidate_select_keys: "12x".to_owned(),
+            ..AppConfig::default()
+        };
+        assert!(validate_config(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("ASCII digits"));
+
+        let config = AppConfig {
+            english_commit_key: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        assert!(validate_config(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("candidate_select_keys"));
+
+        let config = AppConfig {
+            candidate_page_next_key: DEFAULT_CANDIDATE_PAGE_PREVIOUS_KEY.to_owned(),
+            ..AppConfig::default()
+        };
+        assert!(validate_config(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("must be distinct"));
+
+        let config = AppConfig {
+            candidate_count: DEFAULT_CANDIDATE_SELECT_KEYS.chars().count() + 1,
+            ..AppConfig::default()
+        };
+        assert!(validate_config(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("capacity"));
+
+        let config = AppConfig {
+            candidate_page_next_key: String::new(),
+            ..AppConfig::default()
+        };
+        assert!(validate_config(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("exactly one character"));
+
+        let config = AppConfig {
+            english_commit_key: "ab".to_owned(),
+            ..AppConfig::default()
+        };
+        assert!(validate_config(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("exactly one printable character"));
+
+        let config = AppConfig {
+            candidate_page_next_key: "a".to_owned(),
+            ..AppConfig::default()
+        };
+        assert!(validate_config(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("pinyin"));
+
+        let config = AppConfig {
+            english_commit_key: ";".to_owned(),
+            ..AppConfig::default()
+        };
+        assert!(validate_config(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("trigger character"));
+    }
+
+    #[test]
+    fn loads_and_classifies_custom_candidate_interaction_keys() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = env::temp_dir().join(format!(
+            "rime-poc-custom-interaction-{}-{unique}.toml",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            r#"
+trigger_prefix = ";;"
+trigger_suffix = ";;"
+candidate_count = 5
+candidate_select_keys = "0987654321"
+candidate_page_next_key = "]"
+candidate_page_previous_key = "["
+english_commit_key = "\\"
+"#,
+        )
+        .unwrap();
+
+        let (config, loaded_path) = load_config(Some(path.clone())).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(loaded_path.as_deref(), Some(path.as_path()));
+        assert!(validate_config(&config).is_ok());
+        assert_eq!(
+            config.candidate_interaction_key('0'),
+            Some(CandidateInteractionKey::Select(0))
+        );
+        assert_eq!(
+            config.candidate_interaction_key('1'),
+            Some(CandidateInteractionKey::Select(9))
+        );
+        assert_eq!(
+            config.candidate_interaction_key(']'),
+            Some(CandidateInteractionKey::NextPage)
+        );
+        assert_eq!(
+            config.candidate_interaction_key('['),
+            Some(CandidateInteractionKey::PreviousPage)
+        );
+        assert_eq!(
+            config.candidate_interaction_key('\\'),
+            Some(CandidateInteractionKey::EnglishCommit)
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the bundled Rime data and native librime"]
+    fn rime_candidate_selection_and_paging_integration() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let shared_data_dir = manifest_dir.join("data/shared");
+        let user_data_dir =
+            env::temp_dir().join(format!("rime-poc-candidate-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&user_data_dir);
+        fs::create_dir_all(&user_data_dir).unwrap();
+        fs::copy(
+            manifest_dir.join("data/user/default.custom.yaml"),
+            user_data_dir.join("default.custom.yaml"),
+        )
+        .unwrap();
+
+        let mut traits = Traits::new();
+        traits
+            .set_shared_data_dir(path_to_str(&shared_data_dir).unwrap())
+            .set_user_data_dir(path_to_str(&user_data_dir).unwrap())
+            .set_distribution_name("rime-poc-test")
+            .set_distribution_code_name("rime-poc-test")
+            .set_distribution_version(env!("CARGO_PKG_VERSION"))
+            .set_app_name("rime-poc-test")
+            .set_min_log_level(2);
+        setup(&mut traits);
+        initialize(&mut traits);
+
+        let result = (|| -> Result<()> {
+            if !matches!(full_deploy_and_wait(), DeployResult::Success) {
+                bail!("Rime deployment failed")
+            }
+            let options = Options {
+                shared_data_dir,
+                user_data_dir: user_data_dir.clone(),
+                schema: "luna_pinyin_simp".to_owned(),
+                config_path: None,
+                config: AppConfig::default(),
+                body_mode: false,
+                doctor: false,
+                listen: false,
+                max_buffer_chars: DEFAULT_MAX_BUFFER_CHARS,
+                inject_delay_ms: DEFAULT_INJECT_DELAY_MS,
+                log_events: false,
+                input: String::new(),
+            };
+
+            let first_page = preview_candidates(&options, "shi", 5, 0)?;
+            anyhow::ensure!(!first_page.candidates.is_empty(), "first page is empty");
+            anyhow::ensure!(first_page.page_no == 0, "first page number is not zero");
+
+            let second_page = preview_candidates(&options, "shi", 5, 1)?;
+            anyhow::ensure!(second_page.page_no == 1, "failed to move to page 1");
+            anyhow::ensure!(!second_page.candidates.is_empty(), "second page is empty");
+            anyhow::ensure!(
+                first_page.candidates != second_page.candidates,
+                "page navigation did not change candidates"
+            );
+            let expected_selected = second_page
+                .candidates
+                .get(1)
+                .context("second page has fewer than two candidates")?
+                .clone();
+
+            let selected = select_candidate(&options, "shi", 1, 1)?;
+            anyhow::ensure!(
+                selected.as_deref() == Some(expected_selected.as_str()),
+                "candidate selection did not commit the displayed page candidate: expected={expected_selected:?} actual={selected:?}"
+            );
+            Ok(())
+        })();
+
+        finalize();
+        let _ = fs::remove_dir_all(&user_data_dir);
+        result.unwrap();
     }
 }

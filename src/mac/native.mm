@@ -4,6 +4,7 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <Foundation/Foundation.h>
 
+#include <algorithm>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -37,13 +38,12 @@ typedef struct {
   uintptr_t source_buffer_len;
 } PalInputEvent;
 
-typedef void (*PalEventCallback)(PalInputEvent event);
+typedef int32_t (*PalEventCallback)(PalInputEvent event);
 
 }
 
 static constexpr CGFloat PAL_EVENT_MARKER = -27469;
 static PalEventCallback PAL_CALLBACK = nullptr;
-static id PAL_MONITOR = nil;
 static id PAL_WORKSPACE_OBSERVER = nil;
 static id PAL_INPUT_SOURCE_OBSERVER = nil;
 static NSPanel *PAL_CANDIDATE_PANEL = nil;
@@ -56,6 +56,9 @@ static uint64_t PAL_REWRITE_TRANSACTION_GENERATION = 0;
 static std::vector<PalInputEvent> PAL_REWRITE_BUFFERED_EVENTS;
 static std::vector<uint32_t> PAL_REWRITE_SWALLOWED_KEYUPS;
 static bool PAL_REWRITE_OPERATION_RUNNING = false;
+static std::vector<std::string> PAL_SHIFTED_KEY_TEXT(128);
+static std::vector<std::string> PAL_CAPS_LOCK_KEY_TEXT(128);
+static std::vector<std::string> PAL_SHIFTED_CAPS_LOCK_KEY_TEXT(128);
 
 struct PalRewriteOperation {
   uint32_t delete_count;
@@ -80,10 +83,6 @@ static bool native_event_logging_enabled() {
     return false;
   }
   return strcmp(value, "0") != 0 && strcmp(value, "false") != 0 && strcmp(value, "FALSE") != 0;
-}
-
-static bool is_marked_event(NSEvent *event) {
-  return fabs(event.locationInWindow.x - PAL_EVENT_MARKER) < 0.001;
 }
 
 static void post_key(uint16_t key_code, bool down, int32_t delay_ms) {
@@ -111,24 +110,119 @@ static uint32_t pal_modifier_flags_from_cg(CGEventFlags flags) {
   return result;
 }
 
-static uint32_t pal_modifier_flags_from_ns(NSEventModifierFlags flags) {
-  uint32_t result = 0;
-  if ((flags & NSEventModifierFlagCommand) != 0) {
-    result |= PAL_INPUT_MODIFIER_COMMAND;
+static void copy_current_input_source_fingerprint(PalInputEvent *input);
+
+static void pal_populate_keyboard_layout_text(
+    const UCKeyboardLayout *layout,
+    UInt32 keyboard_type,
+    UInt32 carbon_modifiers,
+    std::vector<std::string> *table) {
+  for (std::string &text : *table) {
+    text.clear();
   }
-  if ((flags & NSEventModifierFlagControl) != 0) {
-    result |= PAL_INPUT_MODIFIER_CONTROL;
+
+  for (UInt16 key_code = 0; key_code < table->size(); key_code++) {
+    UInt32 dead_key_state = 0;
+    UniChar chars[32] = {};
+    UniCharCount actual_length = 0;
+    OSStatus status = UCKeyTranslate(
+        layout,
+        key_code,
+        kUCKeyActionDown,
+        (carbon_modifiers >> 8) & 0xff,
+        keyboard_type,
+        kUCKeyTranslateNoDeadKeysBit,
+        &dead_key_state,
+        (UniCharCount)(sizeof(chars) / sizeof(chars[0])),
+        &actual_length,
+        chars);
+    if (status != noErr || actual_length == 0) {
+      continue;
+    }
+
+    CFStringRef string = CFStringCreateWithCharacters(
+        kCFAllocatorDefault,
+        chars,
+        actual_length);
+    if (string != nullptr) {
+      char buffer[64] = {};
+      if (CFStringGetCString(string, buffer, sizeof(buffer), kCFStringEncodingUTF8)) {
+        (*table)[key_code] = buffer;
+      }
+      CFRelease(string);
+    }
   }
-  if ((flags & NSEventModifierFlagOption) != 0) {
-    result |= PAL_INPUT_MODIFIER_OPTION;
-  }
-  if ((flags & NSEventModifierFlagShift) != 0) {
-    result |= PAL_INPUT_MODIFIER_SHIFT;
-  }
-  return result;
 }
 
-static void copy_current_input_source_fingerprint(PalInputEvent *input);
+static void pal_refresh_keyboard_layout() {
+  PAL_SHIFTED_KEY_TEXT.assign(PAL_SHIFTED_KEY_TEXT.size(), std::string());
+  PAL_CAPS_LOCK_KEY_TEXT.assign(PAL_CAPS_LOCK_KEY_TEXT.size(), std::string());
+  PAL_SHIFTED_CAPS_LOCK_KEY_TEXT.assign(
+      PAL_SHIFTED_CAPS_LOCK_KEY_TEXT.size(),
+      std::string());
+
+  TISInputSourceRef source = TISCopyCurrentKeyboardLayoutInputSource();
+  if (source == nullptr) {
+    return;
+  }
+
+  CFDataRef layout_data = (CFDataRef)TISGetInputSourceProperty(
+      source,
+      kTISPropertyUnicodeKeyLayoutData);
+  if (layout_data == nullptr) {
+    CFRelease(source);
+    return;
+  }
+
+  const UCKeyboardLayout *layout =
+      (const UCKeyboardLayout *)CFDataGetBytePtr(layout_data);
+  if (layout == nullptr) {
+    CFRelease(source);
+    return;
+  }
+
+  UInt32 keyboard_type = LMGetKbdType();
+  pal_populate_keyboard_layout_text(
+      layout,
+      keyboard_type,
+      shiftKey,
+      &PAL_SHIFTED_KEY_TEXT);
+  pal_populate_keyboard_layout_text(
+      layout,
+      keyboard_type,
+      alphaLock,
+      &PAL_CAPS_LOCK_KEY_TEXT);
+  pal_populate_keyboard_layout_text(
+      layout,
+      keyboard_type,
+      shiftKey | alphaLock,
+      &PAL_SHIFTED_CAPS_LOCK_KEY_TEXT);
+  CFRelease(source);
+}
+
+static const std::string *modified_keyboard_layout_text(CGEventRef event) {
+  int64_t key_code = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
+  if (key_code < 0 || (size_t)key_code >= PAL_SHIFTED_KEY_TEXT.size()) {
+    return nullptr;
+  }
+
+  CGEventFlags flags = CGEventGetFlags(event);
+  bool shifted = (flags & kCGEventFlagMaskShift) != 0;
+  bool caps_locked = (flags & kCGEventFlagMaskAlphaShift) != 0;
+  const std::vector<std::string> *table = nullptr;
+  if (shifted && caps_locked) {
+    table = &PAL_SHIFTED_CAPS_LOCK_KEY_TEXT;
+  } else if (shifted) {
+    table = &PAL_SHIFTED_KEY_TEXT;
+  } else if (caps_locked) {
+    table = &PAL_CAPS_LOCK_KEY_TEXT;
+  } else {
+    return nullptr;
+  }
+
+  const std::string &text = (*table)[(size_t)key_code];
+  return text.empty() ? nullptr : &text;
+}
 
 static bool pal_rewrite_is_busy() {
   return PAL_REWRITE_TRANSACTION_ACTIVE ||
@@ -165,7 +259,7 @@ static void dispatch_context_event(const char *reason) {
     fflush(stderr);
   }
 
-  PAL_CALLBACK(input);
+  (void)PAL_CALLBACK(input);
 }
 
 extern "C" bool pal_pinyin_is_accessibility_trusted(bool prompt) {
@@ -285,6 +379,19 @@ static void copy_cg_event_text(PalInputEvent *input, CGEventRef event) {
       kCFAllocatorDefault,
       chars,
       actual_length);
+  CGEventFlags flags = CGEventGetFlags(event);
+  if ((flags & (kCGEventFlagMaskShift | kCGEventFlagMaskAlphaShift)) != 0 &&
+      actual_length == 1 && chars[0] < 128) {
+    const std::string *modified = modified_keyboard_layout_text(event);
+    if (modified != nullptr) {
+      CFRelease(string);
+      size_t length = std::min(modified->size(), sizeof(input->buffer) - 1);
+      memcpy(input->buffer, modified->data(), length);
+      input->buffer[length] = '\0';
+      input->buffer_len = length;
+      return;
+    }
+  }
   copy_string_to_input_buffer(input, string);
   CFRelease(string);
 }
@@ -306,8 +413,28 @@ static bool pal_take_swallowed_keyup(uint32_t key_code) {
   return false;
 }
 
+static void pal_remember_swallowed_keyup(uint32_t key_code) {
+  for (uint32_t existing : PAL_REWRITE_SWALLOWED_KEYUPS) {
+    if (existing == key_code) {
+      return;
+    }
+  }
+  PAL_REWRITE_SWALLOWED_KEYUPS.push_back(key_code);
+}
+
+static void pal_forget_swallowed_keyup(uint32_t key_code) {
+  for (auto it = PAL_REWRITE_SWALLOWED_KEYUPS.begin();
+       it != PAL_REWRITE_SWALLOWED_KEYUPS.end();) {
+    if (*it == key_code) {
+      it = PAL_REWRITE_SWALLOWED_KEYUPS.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
 static bool pal_maybe_buffer_rewrite_event(PalInputEvent input) {
-  if (!PAL_REWRITE_TRANSACTION_ACTIVE || input.event_type != PAL_INPUT_EVENT_KEYBOARD) {
+  if (input.event_type != PAL_INPUT_EVENT_KEYBOARD) {
     return false;
   }
 
@@ -315,12 +442,17 @@ static bool pal_maybe_buffer_rewrite_event(PalInputEvent input) {
     return pal_take_swallowed_keyup(input.key_code);
   }
 
-  if (input.buffer_len == 0 || pal_input_has_text_modifier(input)) {
+  if (!PAL_REWRITE_TRANSACTION_ACTIVE) {
+    return false;
+  }
+
+  bool is_backspace = input.key_code == 0x33;
+  if ((input.buffer_len == 0 && !is_backspace) || pal_input_has_text_modifier(input)) {
     return false;
   }
 
   PAL_REWRITE_BUFFERED_EVENTS.push_back(input);
-  PAL_REWRITE_SWALLOWED_KEYUPS.push_back(input.key_code);
+  pal_remember_swallowed_keyup(input.key_code);
   if (PAL_LOG_EVENTS) {
     fprintf(stderr,
             "[rime-poc native] rewrite transaction buffered key=%u chars=%s len=%lu\n",
@@ -347,7 +479,7 @@ static void pal_replay_rewrite_buffered_events(std::vector<PalInputEvent> events
   for (size_t i = 0; i < events.size(); i++) {
     PalInputEvent input = events[i];
     input.modifier_flags |= PAL_INPUT_MODIFIER_BUFFERED_REPLAY;
-    PAL_CALLBACK(input);
+    (void)PAL_CALLBACK(input);
     if (PAL_REWRITE_TRANSACTION_ACTIVE) {
       size_t remaining_count = events.size() - i - 1;
       if (remaining_count > 0) {
@@ -530,8 +662,13 @@ static bool dispatch_cg_event(CGEventType type, CGEventRef event) {
       return true;
     }
 
-    PAL_CALLBACK(input);
-    return false;
+    bool consumed = PAL_CALLBACK(input) != 0;
+    if (consumed && input.status == PAL_INPUT_STATUS_PRESSED) {
+      pal_remember_swallowed_keyup(input.key_code);
+    } else if (!consumed && input.status == PAL_INPUT_STATUS_PRESSED) {
+      pal_forget_swallowed_keyup(input.key_code);
+    }
+    return consumed;
   }
 
   input.event_type = PAL_INPUT_EVENT_MOUSE;
@@ -548,8 +685,7 @@ static bool dispatch_cg_event(CGEventType type, CGEventRef event) {
     fflush(stderr);
   }
 
-  PAL_CALLBACK(input);
-  return false;
+  return PAL_CALLBACK(input) != 0;
 }
 
 static CGEventRef event_tap_callback(
@@ -970,15 +1106,12 @@ static void pal_render_candidate_panel(
   CGFloat preedit_width = MIN(MAX(preedit_size.width, 80.0), content_max_width);
 
   NSMutableArray<NSTextField *> *candidate_labels = [NSMutableArray array];
-  NSUInteger index = 1;
   for (NSString *candidate in candidates) {
-    NSString *display = [NSString stringWithFormat:@"%lu. %@", (unsigned long)index, candidate];
     NSTextField *label = pal_make_label(
-        display,
+        candidate,
         [NSFont systemFontOfSize:14.0 weight:NSFontWeightRegular],
         [NSColor labelColor]);
     [candidate_labels addObject:label];
-    index += 1;
   }
 
   if (candidate_labels.count == 0) {
@@ -1148,6 +1281,18 @@ extern "C" void pal_pinyin_finish_rewrite_transaction_after_delay(int32_t delay_
       });
 }
 
+extern "C" void pal_pinyin_abort_rewrite_transaction() {
+  if (PAL_REWRITE_OPERATION_RUNNING || !PAL_REWRITE_OPERATION_QUEUE.empty()) {
+    fprintf(stderr,
+            "[rime-poc native] refused to abort committed rewrite transaction running=%d queued=%lu\n",
+            PAL_REWRITE_OPERATION_RUNNING ? 1 : 0,
+            (unsigned long)PAL_REWRITE_OPERATION_QUEUE.size());
+    fflush(stderr);
+    return;
+  }
+  pal_pinyin_finish_rewrite_transaction_after_delay(0);
+}
+
 extern "C" void pal_pinyin_commit_rewrite_transaction(
     uint32_t delete_count,
     const char *replacement_text,
@@ -1186,6 +1331,7 @@ extern "C" void pal_pinyin_start_event_loop(PalEventCallback callback) {
 
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+    pal_refresh_keyboard_layout();
 
     PAL_WORKSPACE_OBSERVER = [[[NSWorkspace sharedWorkspace] notificationCenter]
         addObserverForName:NSWorkspaceDidActivateApplicationNotification
@@ -1202,6 +1348,7 @@ extern "C" void pal_pinyin_start_event_loop(PalEventCallback callback) {
                      queue:[NSOperationQueue mainQueue]
                 usingBlock:^(NSNotification *notification) {
                   (void)notification;
+                  pal_refresh_keyboard_layout();
                   dispatch_context_event("keyboard_selection_changed");
                 }];
 
@@ -1237,99 +1384,10 @@ extern "C" void pal_pinyin_start_event_loop(PalEventCallback callback) {
       return;
     }
 
-    fprintf(stderr, "[rime-poc native] failed to register CGEvent tap; falling back to NSEvent monitor\n");
+    fprintf(stderr,
+            "[rime-poc native] failed to register required suppressing CGEvent tap; listener cannot start safely\n");
     fflush(stderr);
-
-    NSEventMask mask = NSEventMaskKeyDown |
-                       NSEventMaskKeyUp |
-                       NSEventMaskFlagsChanged |
-                       NSEventMaskLeftMouseDown |
-                       NSEventMaskRightMouseDown |
-                       NSEventMaskOtherMouseDown;
-
-    PAL_MONITOR = [NSEvent addGlobalMonitorForEventsMatchingMask:mask handler:^(NSEvent *event) {
-      @autoreleasepool {
-        if (PAL_CALLBACK == nullptr || is_marked_event(event)) {
-          if (PAL_LOG_EVENTS) {
-            fprintf(stderr,
-                    "[rime-poc native] skipped marked/self event type=%ld key=%hu\n",
-                    (long)event.type,
-                    event.keyCode);
-            fflush(stderr);
-          }
-          return;
-        }
-
-        PalInputEvent input = {};
-        if (event.type == NSEventTypeKeyDown ||
-            event.type == NSEventTypeKeyUp ||
-            event.type == NSEventTypeFlagsChanged) {
-          input.event_type = PAL_INPUT_EVENT_KEYBOARD;
-          input.status = event.type == NSEventTypeKeyUp
-              ? PAL_INPUT_STATUS_RELEASED
-              : PAL_INPUT_STATUS_PRESSED;
-          input.key_code = event.keyCode;
-          input.modifier_flags = pal_modifier_flags_from_ns(event.modifierFlags);
-          if (event.type == NSEventTypeFlagsChanged &&
-              (event.modifierFlags & NSEventModifierFlagShift) == 0) {
-            input.status = PAL_INPUT_STATUS_RELEASED;
-          }
-          copy_current_input_source_fingerprint(&input);
-          pal_mark_rewrite_active(&input);
-
-          if (event.type != NSEventTypeFlagsChanged) {
-            NSString *characters = event.characters;
-            if (characters != nil) {
-              const char *chars = [characters UTF8String];
-              if (chars != nullptr) {
-                strncpy(input.buffer, chars, sizeof(input.buffer) - 1);
-                input.buffer[sizeof(input.buffer) - 1] = '\0';
-                input.buffer_len = strlen(input.buffer);
-              }
-            }
-          }
-
-          if (PAL_LOG_EVENTS) {
-            fprintf(stderr,
-                    "[rime-poc native] key event type=%ld status=%d key=%u modifiers=%u chars=%s len=%lu source=%s\n",
-                    (long)event.type,
-                    input.status,
-                    input.key_code,
-                    input.modifier_flags,
-                    input.buffer_len > 0 ? input.buffer : "<empty>",
-                    (unsigned long)input.buffer_len,
-                    input.source_buffer_len > 0 ? input.source_buffer : "<unknown>");
-            fflush(stderr);
-          }
-
-          PAL_CALLBACK(input);
-          return;
-        }
-
-        input.event_type = PAL_INPUT_EVENT_MOUSE;
-        input.status = PAL_INPUT_STATUS_PRESSED;
-        input.key_code = 0;
-        copy_current_input_source_fingerprint(&input);
-        pal_mark_rewrite_active(&input);
-        if (PAL_LOG_EVENTS) {
-          fprintf(stderr,
-                  "[rime-poc native] mouse event type=%ld source=%s\n",
-                  (long)event.type,
-                  input.source_buffer_len > 0 ? input.source_buffer : "<unknown>");
-          fflush(stderr);
-        }
-        PAL_CALLBACK(input);
-      }
-    }];
-
-    if (PAL_MONITOR == nil) {
-      fprintf(stderr, "[rime-poc native] failed to register global monitor\n");
-    } else {
-      fprintf(stderr, "[rime-poc native] global monitor registered\n");
-    }
-    fflush(stderr);
-
-    [[NSRunLoop currentRunLoop] run];
+    PAL_CALLBACK = nullptr;
   }
 }
 

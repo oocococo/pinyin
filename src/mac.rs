@@ -24,12 +24,11 @@ pub const KEY_RETURN: u32 = 76;
 pub const KEY_ESCAPE: u32 = 53;
 pub const KEY_A: u32 = 0;
 pub const KEY_C: u32 = 8;
+pub const KEY_H: u32 = 4;
 pub const KEY_V: u32 = 9;
 pub const KEY_W: u32 = 13;
 pub const KEY_X: u32 = 7;
 pub const KEY_Z: u32 = 6;
-pub const KEY_SHIFT_LEFT: u32 = 56;
-pub const KEY_SHIFT_RIGHT: u32 = 60;
 pub const KEY_TAB: u32 = 48;
 pub const KEY_GRAVE: u32 = 50;
 pub const KEY_ARROW_LEFT: u32 = 123;
@@ -70,27 +69,27 @@ impl InputEvent {
     }
 
     pub fn has_command_modifier(&self) -> bool {
-        let flags = self.modifier_flags as u32;
+        let flags = self.modifier_flags;
         flags & MODIFIER_COMMAND != 0
     }
 
     pub fn has_control_modifier(&self) -> bool {
-        let flags = self.modifier_flags as u32;
+        let flags = self.modifier_flags;
         flags & MODIFIER_CONTROL != 0
     }
 
     pub fn has_text_modifier(&self) -> bool {
-        let flags = self.modifier_flags as u32;
+        let flags = self.modifier_flags;
         flags & (MODIFIER_COMMAND | MODIFIER_CONTROL | MODIFIER_OPTION) != 0
     }
 
     pub fn is_buffered_replay(&self) -> bool {
-        let flags = self.modifier_flags as u32;
+        let flags = self.modifier_flags;
         flags & MODIFIER_BUFFERED_REPLAY != 0
     }
 
     pub fn is_rewrite_active(&self) -> bool {
-        let flags = self.modifier_flags as u32;
+        let flags = self.modifier_flags;
         flags & MODIFIER_REWRITE_ACTIVE != 0
     }
 }
@@ -130,6 +129,10 @@ pub fn begin_rewrite_transaction() {
     unsafe { pal_pinyin_begin_rewrite_transaction() };
 }
 
+pub fn cancel_rewrite_transaction() {
+    unsafe { pal_pinyin_abort_rewrite_transaction() };
+}
+
 pub fn commit_rewrite_transaction(
     delete_chars: usize,
     replacement_text: &str,
@@ -143,7 +146,7 @@ pub fn commit_rewrite_transaction(
     Ok(())
 }
 
-pub fn start_event_loop(callback: extern "C" fn(InputEvent)) -> ! {
+pub fn start_event_loop(callback: extern "C" fn(InputEvent) -> c_int) -> ! {
     unsafe { pal_pinyin_start_event_loop(callback) };
     unreachable!("macOS event loop returned unexpectedly")
 }
@@ -152,7 +155,7 @@ unsafe extern "C" {
     fn pal_pinyin_is_accessibility_trusted(prompt: bool) -> bool;
     fn pal_pinyin_has_input_monitoring_access() -> bool;
     fn pal_pinyin_request_input_monitoring_access() -> bool;
-    fn pal_pinyin_start_event_loop(callback: extern "C" fn(InputEvent));
+    fn pal_pinyin_start_event_loop(callback: extern "C" fn(InputEvent) -> c_int);
     fn pal_pinyin_update_candidate_panel(
         preedit: *const c_char,
         candidates: *const c_char,
@@ -160,6 +163,7 @@ unsafe extern "C" {
     );
     fn pal_pinyin_hide_candidate_panel();
     fn pal_pinyin_begin_rewrite_transaction();
+    fn pal_pinyin_abort_rewrite_transaction();
     fn pal_pinyin_commit_rewrite_transaction(
         delete_chars: c_uint,
         replacement_text: *const c_char,

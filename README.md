@@ -58,14 +58,21 @@ trigger_prefix = ";;"
 trigger_suffix = ";;"
 candidate_layout = "horizontal"
 candidate_count = 5
+candidate_select_keys = "1234567890"
+candidate_page_next_key = "="
+candidate_page_previous_key = "-"
+english_commit_key = "`"
 ```
 
 Trigger strings cannot contain punctuation that is reserved for separating
 pinyin runs inside the body: comma, period, question mark, exclamation mark, minus, plus,
 ellipsis, tilde, or double quote, including common Chinese/full-width variants.
 The listener candidate UI supports `candidate_layout = "horizontal"` or
-`"vertical"` and shows `candidate_count` candidates from 1 to 20. The default
-is a horizontal list with 5 candidates.
+`"vertical"`. It shows up to `candidate_count` candidates and labels them with
+`candidate_select_keys`; the count cannot exceed the number of configured
+selection keys. The defaults are a horizontal list with 5 candidates, numeric
+selection keys `1234567890`, `=` for the next page, `-` for the previous page,
+and backtick for committing pending input as raw English.
 
 ## Usage
 
@@ -126,25 +133,55 @@ While the session is active, Space or any non-pinyin separator that is not part
 of the configured trigger converts the preceding pinyin immediately, so you do
 not have to wait for the closing trigger. Space acts like a commit key and is
 not reinserted; punctuation separators are kept and mapped where a mapping
-exists. Incremental conversion moves the visible active marker to the current
-editing position, after the committed output. Previously committed output is
-then treated as application-owned text: the closing trigger only removes the
-current marker, pending raw text, and suffix, and does not rewrite earlier
-converted text. Pressing Backspace immediately after an incremental conversion
-restores the original pinyin text with the active marker for editing.
+exists. The candidate panel remains the active-state indicator after committed
+output. The closing trigger only removes pending raw text and the suffix; it
+does not rewrite earlier converted text. Pressing Backspace immediately after
+an incremental conversion restores the original pinyin text for editing.
+The listener separately tracks pending raw text, committed output that still
+belongs to the active session, and the hidden opening prefix. Deleting all
+visible session output therefore keeps the session active until one additional
+Backspace per opening-prefix character has been received. Those final virtual
+Backspaces are consumed by the event tap, so they do not delete text that was
+present before the trigger.
 
-The configured trigger is reserved for state changes: with the default config,
-`;;` enters the active session and `;;` exits it. Trigger characters such as
+If a pinyin run has no Rime candidate, the listener commits that run unchanged
+instead of treating it as a fatal conversion error. For example, `vke<Space>`
+leaves `vke` as raw text and the listener remains usable. Rewrite transactions
+also have an abort guard: any error before a native rewrite is committed
+restores the logical input and releases/replays buffered keyboard events.
+
+The configured trigger is reserved for state changes: the same configured pair
+enters and exits the active session. Trigger characters such as
 `;` are not treated as incremental separators, avoiding ambiguity between a
 single trigger character and the full trigger. Each opening trigger starts an
 isolated session; text before that trigger is not part of the active capture
 buffer. When the opening trigger is detected, the listener deletes those trigger
 characters and shows a non-activating macOS candidate panel as the active-state
 indicator. As pinyin is typed, the panel shows the current Rime preedit and the
-configured number of candidates. Candidate selection is not handled yet; the UI
-is display-only. The panel is positioned from the macOS Accessibility caret
-bounds when available, including browser text-marker ranges, then falls back to
-focused text-field bounds and finally the mouse anchor. Mouse context changes,
+configured number of candidates. Only ASCII letters and apostrophes enter the
+pending pinyin buffer. While that pending pinyin produces a candidate menu, a
+configured selection key chooses its corresponding available candidate and the
+configured page keys (`=` / `-` by default) move to the next / previous page. A
+selection key is not consumed when its page has no corresponding candidate.
+Candidate selection and paging keys type normally when there is no pending
+candidate menu and never enter an empty pinyin buffer. If pending letters have
+no Rime menu (for example invalid pinyin), both those letters and the control
+key are committed literally, so `vke-` remains ASCII `vke-`.
+
+The configured English commit key (backtick by default) commits the pending
+pinyin text unchanged whenever it contains an ASCII letter, and consumes only
+the delimiter. With no pending letters it types normally. Shift itself never
+clears the session: an unmodified Shift is a no-op, and shifted text such as
+`Shift+1` continues through the normal `!` punctuation path.
+
+Candidate previews, page changes, and selections use reconstructed short Rime
+sessions. Page navigation calls librime's page API and candidate selection calls
+the current-page selection API; configured host keys are not sent to Rime as a
+schema-dependent shortcut.
+
+The panel is positioned from the macOS Accessibility caret bounds when
+available, including browser text-marker ranges, then falls back to focused
+text-field bounds and finally the mouse anchor. Mouse context changes,
 active application changes, input source
 changes, and Command-Tab/Command-Backtick window switch shortcuts clear the
 active session and hide the panel. The listener also records the macOS input
@@ -153,9 +190,9 @@ the input route changes before conversion, it abandons the internal session
 without deleting or injecting text. Only macOS system input sources with
 `source=com.apple...` are allowed to open or continue a session; third-party
 input methods are ignored even if they are in an English/direct-input mode.
-Pressing Shift by itself aborts the active session, which covers IME
-Chinese/English toggles.
-During the short rewrite window where the listener deletes raw pinyin and
+The listener requires a suppressing CGEvent tap; it stops instead of falling
+back to a passive global monitor if that tap cannot be created. During the short
+rewrite window where the listener deletes raw pinyin and
 injects converted text, the macOS event tap temporarily buffers ordinary typed
 characters and replays them into the active session after the rewrite finishes.
 For separator-triggered conversion, this rewrite transaction starts before the

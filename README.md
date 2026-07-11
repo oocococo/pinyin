@@ -126,15 +126,25 @@ While the session is active, Space or any non-pinyin separator that is not part
 of the configured trigger converts the preceding pinyin immediately, so you do
 not have to wait for the closing trigger. Space acts like a commit key and is
 not reinserted; punctuation separators are kept and mapped where a mapping
-exists. Incremental conversion moves the visible active marker to the current
-editing position, after the committed output. Previously committed output is
-then treated as application-owned text: the closing trigger only removes the
-current marker, pending raw text, and suffix, and does not rewrite earlier
-converted text. Pressing Backspace immediately after an incremental conversion
-restores the original pinyin text with the active marker for editing.
+exists. The candidate panel remains the active-state indicator after committed
+output. The closing trigger only removes pending raw text and the suffix; it
+does not rewrite earlier converted text. Pressing Backspace immediately after
+an incremental conversion restores the original pinyin text for editing.
+The listener separately tracks pending raw text, committed output that still
+belongs to the active session, and the hidden opening prefix. Deleting all
+visible session output therefore keeps the session active until one additional
+Backspace per opening-prefix character has been received. Those final virtual
+Backspaces are consumed by the event tap, so they do not delete text that was
+present before the trigger.
 
-The configured trigger is reserved for state changes: with the default config,
-`;;` enters the active session and `;;` exits it. Trigger characters such as
+If a pinyin run has no Rime candidate, the listener commits that run unchanged
+instead of treating it as a fatal conversion error. For example, `vke<Space>`
+leaves `vke` as raw text and the listener remains usable. Rewrite transactions
+also have an abort guard: any error before a native rewrite is committed
+restores the logical input and releases/replays buffered keyboard events.
+
+The configured trigger is reserved for state changes: the same configured pair
+enters and exits the active session. Trigger characters such as
 `;` are not treated as incremental separators, avoiding ambiguity between a
 single trigger character and the full trigger. Each opening trigger starts an
 isolated session; text before that trigger is not part of the active capture
@@ -155,7 +165,9 @@ without deleting or injecting text. Only macOS system input sources with
 input methods are ignored even if they are in an English/direct-input mode.
 Pressing Shift by itself aborts the active session, which covers IME
 Chinese/English toggles.
-During the short rewrite window where the listener deletes raw pinyin and
+The listener requires a suppressing CGEvent tap; it stops instead of falling
+back to a passive global monitor if that tap cannot be created. During the short
+rewrite window where the listener deletes raw pinyin and
 injects converted text, the macOS event tap temporarily buffers ordinary typed
 characters and replays them into the active session after the rewrite finishes.
 For separator-triggered conversion, this rewrite transaction starts before the

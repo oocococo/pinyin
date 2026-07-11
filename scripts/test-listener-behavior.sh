@@ -33,11 +33,6 @@ default_shared_data_dir() {
   printf '%s\n' "$PWD/data/shared"
 }
 
-toml_string() {
-  local key="$1"
-  sed -n "s/^[[:space:]]*$key[[:space:]]*=[[:space:]]*\"\\(.*\\)\"[[:space:]]*$/\\1/p" rime-poc.toml | head -n 1
-}
-
 export RIME_INCLUDE_DIR="${RIME_INCLUDE_DIR:-$(brew --prefix librime)/include}"
 export RIME_LIB_DIR="${RIME_LIB_DIR:-$(brew --prefix librime)/lib}"
 export RIME_SHARED_DATA_DIR="${RIME_SHARED_DATA_DIR:-$(default_shared_data_dir)}"
@@ -57,9 +52,9 @@ if [[ ! -d "$RIME_SHARED_DATA_DIR" ]]; then
   exit 1
 fi
 
-trigger_prefix="${RIME_POC_TEST_TRIGGER_PREFIX:-$(toml_string trigger_prefix)}"
+trigger_prefix="${RIME_POC_TEST_TRIGGER_PREFIX:-;;}"
 if [[ -z "$trigger_prefix" ]]; then
-  echo "error: unable to read trigger_prefix from rime-poc.toml" >&2
+  echo "error: RIME_POC_TEST_TRIGGER_PREFIX must not be empty" >&2
   exit 1
 fi
 
@@ -86,6 +81,7 @@ work_dir="$(mktemp -d "${TMPDIR:-/tmp}/rime-poc-behavior.XXXXXX")"
 listener_log="$work_dir/listener.log"
 pid_file="$work_dir/listener.pid"
 input_source_helper="$work_dir/select-system-input-source"
+listener_config="$work_dir/rime-poc.toml"
 
 cleanup() {
   if [[ -f "$pid_file" ]]; then
@@ -107,6 +103,33 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+
+python3 - "$PWD/rime-poc.toml" "$listener_config" "$trigger_prefix" <<'PY'
+import json
+import re
+import sys
+
+source_path, destination_path, trigger = sys.argv[1:]
+with open(source_path, encoding="utf-8") as source:
+    config = source.read()
+
+encoded_trigger = json.dumps(trigger, ensure_ascii=False)
+config = re.sub(
+    r'(?m)^trigger_prefix\s*=.*$',
+    f"trigger_prefix = {encoded_trigger}",
+    config,
+    count=1,
+)
+config = re.sub(
+    r'(?m)^trigger_suffix\s*=.*$',
+    f"trigger_suffix = {encoded_trigger}",
+    config,
+    count=1,
+)
+with open(destination_path, "w", encoding="utf-8") as destination:
+    destination.write(config)
+PY
+export RIME_POC_CONFIG="$listener_config"
 
 cat > "$work_dir/select-system-input-source.mm" <<'MM'
 #import <Carbon/Carbon.h>
@@ -146,6 +169,8 @@ clang++ "$work_dir/select-system-input-source.mm" \
 
 expected_punctuation="$(cargo run --quiet -- --body 'woyaoceshi,' | sed -n 's/^output:[[:space:]]*//p')"
 expected_backspace="$(cargo run --quiet -- --body 'le' | sed -n 's/^output:[[:space:]]*//p')"
+expected_first_segment="$(cargo run --quiet -- --body 'woyao' | sed -n 's/^output:[[:space:]]*//p')"
+expected_second_segment="$(cargo run --quiet -- --body 'ceshi' | sed -n 's/^output:[[:space:]]*//p')"
 
 cargo build --quiet
 
@@ -171,7 +196,13 @@ if ! grep -q "rime-poc listener started" "$listener_log"; then
   exit 1
 fi
 
-python3 - "$trigger_prefix" "$expected_punctuation" "$expected_backspace" "$input_source_helper" <<'PY'
+python3 - \
+  "$trigger_prefix" \
+  "$expected_punctuation" \
+  "$expected_backspace" \
+  "$expected_first_segment" \
+  "$expected_second_segment" \
+  "$input_source_helper" <<'PY'
 import os
 import subprocess
 import sys
@@ -180,9 +211,12 @@ import time
 trigger_prefix = sys.argv[1]
 expected_punctuation = sys.argv[2]
 expected_backspace = sys.argv[3]
-input_source_helper = sys.argv[4]
+expected_first_segment = sys.argv[4]
+expected_second_segment = sys.argv[5]
+input_source_helper = sys.argv[6]
 settle_seconds = float(os.environ.get("RIME_POC_BEHAVIOR_SETTLE_SECONDS", "10"))
 exit_backspaces = max(1, len(trigger_prefix))
+sentinel = "1234"
 
 prepare_script = r'''
 tell application "TextEdit"
@@ -271,6 +305,12 @@ end tell
 '''
     run_osascript(script)
 
+def start_session_after_sentinel():
+    run_osascript(clear_script)
+    select_abc()
+    type_text(sentinel + trigger_prefix)
+    time.sleep(0.5)
+
 run_osascript(prepare_script)
 select_abc()
 run_osascript(clear_script)
@@ -313,6 +353,104 @@ if actual not in {"le ", "Le "}:
     raise SystemExit(
         "backspace on empty-buffer exit case failed\n"
         "expected: le  or Le \n"
+        f"actual:   {actual}"
+    )
+
+start_session_after_sentinel()
+type_text("woyao ")
+actual = wait_for(sentinel + expected_first_segment)
+if actual != sentinel + expected_first_segment:
+    raise SystemExit(
+        "first committed segment setup failed\n"
+        f"expected: {sentinel + expected_first_segment}\n"
+        f"actual:   {actual}"
+    )
+
+type_text("ceshi ")
+actual = wait_for(sentinel + expected_first_segment + expected_second_segment)
+if actual != sentinel + expected_first_segment + expected_second_segment:
+    raise SystemExit(
+        "second committed segment setup failed\n"
+        f"expected: {sentinel + expected_first_segment + expected_second_segment}\n"
+        f"actual:   {actual}"
+    )
+
+press_backspace(1)
+actual = wait_for(sentinel + expected_first_segment + "ceshi")
+if actual != sentinel + expected_first_segment + "ceshi":
+    raise SystemExit(
+        "latest conversion restore failed\n"
+        f"expected: {sentinel + expected_first_segment + 'ceshi'}\n"
+        f"actual:   {actual}"
+    )
+
+press_backspace(len("ceshi") + len(expected_first_segment))
+actual = wait_for(sentinel)
+if actual != sentinel:
+    raise SystemExit(
+        "deleting all visible session text failed\n"
+        f"expected: {sentinel}\n"
+        f"actual:   {actual}"
+    )
+
+type_text("le ")
+actual = wait_for(sentinel + expected_backspace)
+if actual != sentinel + expected_backspace:
+    raise SystemExit(
+        "session exited before hidden prefix deletion\n"
+        f"expected: {sentinel + expected_backspace}\n"
+        f"actual:   {actual}"
+    )
+
+press_escape()
+start_session_after_sentinel()
+type_text("woyao ")
+actual = wait_for(sentinel + expected_first_segment)
+if actual != sentinel + expected_first_segment:
+    raise SystemExit("hidden-prefix consumption setup failed")
+
+press_backspace(1)
+actual = wait_for(sentinel + "woyao")
+if actual != sentinel + "woyao":
+    raise SystemExit("hidden-prefix conversion restore failed")
+press_backspace(len("woyao"))
+actual = wait_for(sentinel)
+if actual != sentinel:
+    raise SystemExit("hidden-prefix raw deletion failed")
+press_backspace(exit_backspaces)
+actual = wait_for(sentinel)
+if actual != sentinel:
+    raise SystemExit(
+        "hidden-prefix Backspaces deleted text before the trigger\n"
+        f"expected: {sentinel}\n"
+        f"actual:   {actual}"
+    )
+
+type_text("le ")
+actual = wait_for(sentinel + "le ")
+if actual not in {sentinel + "le ", sentinel + "Le "}:
+    raise SystemExit(
+        "session did not exit after hidden prefix deletion\n"
+        f"expected: {sentinel + 'le '} or {sentinel + 'Le '}\n"
+        f"actual:   {actual}"
+    )
+
+start_session_after_sentinel()
+type_text("vke ")
+actual = wait_for(sentinel + "vke")
+if actual != sentinel + "vke":
+    raise SystemExit(
+        "invalid pinyin fallback did not preserve raw text\n"
+        f"expected: {sentinel + 'vke'}\n"
+        f"actual:   {actual}"
+    )
+time.sleep(0.5)
+type_text("abc")
+actual = wait_for(sentinel + "vkeabc")
+if actual != sentinel + "vkeabc":
+    raise SystemExit(
+        "keys after invalid pinyin were swallowed\n"
+        f"expected: {sentinel + 'vkeabc'}\n"
         f"actual:   {actual}"
     )
 PY

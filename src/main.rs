@@ -1789,7 +1789,7 @@ impl ListenerRuntime {
             return Ok(false);
         }
 
-        if let Some(consume) = self.handle_candidate_interaction(&text)? {
+        if let Some(consume) = self.handle_candidate_interaction(event.key_code, &text)? {
             return Ok(consume);
         }
 
@@ -1981,7 +1981,7 @@ impl ListenerRuntime {
         Ok(false)
     }
 
-    fn handle_candidate_interaction(&mut self, text: &str) -> Result<Option<bool>> {
+    fn handle_candidate_interaction(&mut self, key_code: u32, text: &str) -> Result<Option<bool>> {
         let mut chars = text.chars();
         let Some(key) = chars.next() else {
             return Ok(None);
@@ -1994,9 +1994,12 @@ impl ListenerRuntime {
             return Ok(None);
         };
 
-        let Some(interaction) = self.options.config.candidate_interaction_key(key) else {
+        let Some(interaction) =
+            candidate_interaction_for_event(&self.options.config, key_code, key)
+        else {
             return Ok(None);
         };
+        let is_space_selection = key_code == mac::KEY_SPACE && key == ' ';
 
         if interaction == CandidateInteractionKey::EnglishCommit {
             return match self.commit_pending_text(pending, "english") {
@@ -2023,6 +2026,9 @@ impl ListenerRuntime {
             }
         };
         if current.candidates.is_empty() {
+            if is_space_selection {
+                return Ok(None);
+            }
             let replacement = format!("{pending}{key}");
             return match self.commit_pending_literal_text(replacement, "no-candidate literal") {
                 Ok(()) => Ok(Some(true)),
@@ -2371,6 +2377,19 @@ fn event_input_source_fingerprint(event: &mac::InputEvent) -> String {
         "<unknown>".to_owned()
     } else {
         input_source
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn candidate_interaction_for_event(
+    config: &AppConfig,
+    key_code: u32,
+    key: char,
+) -> Option<CandidateInteractionKey> {
+    if key_code == mac::KEY_SPACE && key == ' ' {
+        Some(CandidateInteractionKey::Select(0))
+    } else {
+        config.candidate_interaction_key(key)
     }
 }
 
@@ -3233,6 +3252,29 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn space_selects_first_candidate_on_current_page() {
+        let config = AppConfig::default();
+
+        assert_eq!(
+            candidate_interaction_for_event(&config, mac::KEY_SPACE, ' '),
+            Some(CandidateInteractionKey::Select(0))
+        );
+        assert_eq!(
+            candidate_interaction_for_event(&config, 18, '1'),
+            Some(CandidateInteractionKey::Select(0))
+        );
+        assert_eq!(
+            candidate_interaction_for_event(
+                &config,
+                27,
+                DEFAULT_CANDIDATE_PAGE_NEXT_KEY.chars().next().unwrap()
+            ),
+            Some(CandidateInteractionKey::NextPage)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn space_commit_is_invisible_and_deletes_only_pending_pinyin() {
         let mut capture = test_capture_state();
         capture.push_text(";;ni");
@@ -4003,6 +4045,38 @@ english_commit_key = "\\"
                 first_page.candidates != second_page.candidates,
                 "page navigation did not change candidates"
             );
+            let expected_space_selected = second_page
+                .candidates
+                .first()
+                .context("second page has no first candidate")?
+                .clone();
+            let space_selected = select_candidate(&options, "shi", 1, 0)?;
+            match space_selected {
+                Some(CandidateSelection::Complete { text }) => anyhow::ensure!(
+                    text == expected_space_selected,
+                    "Space selection did not commit the displayed page candidate: expected={expected_space_selected:?} actual={text:?}"
+                ),
+                Some(CandidateSelection::Partial {
+                    selected_text,
+                    remaining_pinyin,
+                }) => {
+                    anyhow::ensure!(
+                        selected_text == expected_space_selected,
+                        "Space partial selection did not choose the displayed page candidate: expected={expected_space_selected:?} actual={selected_text:?}"
+                    );
+                    anyhow::ensure!(
+                        !remaining_pinyin.is_empty(),
+                        "Space partial selection lost the unconsumed pinyin"
+                    );
+                    let remaining_preview =
+                        preview_candidates(&options, &remaining_pinyin, 5, 0)?;
+                    anyhow::ensure!(
+                        !remaining_preview.candidates.is_empty(),
+                        "Space partial selection remainder produced no candidates"
+                    );
+                }
+                None => bail!("Space selection returned no candidate"),
+            }
             let expected_selected = second_page
                 .candidates
                 .get(1)

@@ -502,12 +502,12 @@ if actual != sentinel + expected_shi:
     )
 
 start_session_after_sentinel()
-type_text("shi=1")
+type_text("shi= ")
 page_one_selection = wait_for_candidate_commit(1, 0)
 actual = wait_for(sentinel + page_one_selection)
 if actual != sentinel + page_one_selection or page_one_selection == expected_shi:
     raise SystemExit(
-        "next-page candidate selection failed\n"
+        "Space did not select the first candidate on the displayed page\n"
         f"first-page candidate: {expected_shi}\n"
         f"page-one candidate:  {page_one_selection}\n"
         f"actual:              {actual}"

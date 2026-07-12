@@ -1024,14 +1024,18 @@ static NSRect pal_candidate_panel_frame(NSSize size, PalCandidateAnchor anchor) 
     x = NSMinX(visible) + margin;
   }
 
-  if (y < NSMinY(visible) + margin) {
-    y = anchor.point.y + vertical_offset;
-  }
-  if (y + size.height > NSMaxY(visible) - margin) {
-    y = NSMaxY(visible) - size.height - margin;
-  }
-  if (y < NSMinY(visible) + margin) {
-    y = NSMinY(visible) + margin;
+  // Text anchors must stay below the insertion point. Only the mouse fallback
+  // may flip or clamp vertically to remain visible.
+  if (anchor.kind == PAL_CANDIDATE_ANCHOR_MOUSE) {
+    if (y < NSMinY(visible) + margin) {
+      y = anchor.point.y + vertical_offset;
+    }
+    if (y + size.height > NSMaxY(visible) - margin) {
+      y = NSMaxY(visible) - size.height - margin;
+    }
+    if (y < NSMinY(visible) + margin) {
+      y = NSMinY(visible) + margin;
+    }
   }
 
   return NSMakeRect(round(x), round(y), round(size.width), round(size.height));

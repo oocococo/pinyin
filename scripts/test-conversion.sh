@@ -30,7 +30,7 @@ default_shared_data_dir() {
 
 toml_string() {
   local key="$1"
-  sed -n "s/^[[:space:]]*$key[[:space:]]*=[[:space:]]*\"\\(.*\\)\"[[:space:]]*$/\\1/p" pinyin.toml | head -n 1
+  sed -n "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*\"\\(.*\\)\"[[:space:]]*$/\\1/p" pinyin.toml | head -n 1
 }
 
 export RIME_INCLUDE_DIR="${RIME_INCLUDE_DIR:-$(brew --prefix librime)/include}"

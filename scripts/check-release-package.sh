@@ -58,6 +58,8 @@ for required in \
   "$package_dir/THIRD_PARTY_NOTICES.md" \
   "$package_dir/BUILD-MANIFEST.txt" \
   "$package_dir/data/shared" \
+  "$package_dir/data/shared/opencc/t2s.json" \
+  "$package_dir/data/shared/opencc/TSPhrases.ocd2" \
   "$package_dir/data/user" \
   "$package_dir/lib" \
   "$package_dir/LICENSES/homebrew" \

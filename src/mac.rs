@@ -30,6 +30,7 @@ pub const KEY_W: u32 = 13;
 pub const KEY_X: u32 = 7;
 pub const KEY_Z: u32 = 6;
 pub const KEY_TAB: u32 = 48;
+pub const KEY_SPACE: u32 = 49;
 pub const KEY_GRAVE: u32 = 50;
 pub const KEY_ARROW_LEFT: u32 = 123;
 pub const KEY_ARROW_RIGHT: u32 = 124;

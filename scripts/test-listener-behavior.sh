@@ -174,6 +174,10 @@ expected_second_segment="$(cargo run --quiet -- --body 'ceshi' | sed -n 's/^outp
 expected_ni="$(cargo run --quiet -- --body 'ni' | sed -n 's/^output:[[:space:]]*//p')"
 expected_shifted_punctuation="$(cargo run --quiet -- --body 'ni!' | sed -n 's/^output:[[:space:]]*//p')"
 expected_shi="$(cargo run --quiet -- --body 'shi' | sed -n 's/^output:[[:space:]]*//p')"
+expected_zhongguoren="$(cargo run --quiet -- --body 'zhongguoren' | sed -n 's/^output:[[:space:]]*//p')"
+
+automatic_period_setting="$(defaults read -g NSAutomaticPeriodSubstitutionEnabled 2>/dev/null || printf 'unset')"
+echo "NSAutomaticPeriodSubstitutionEnabled=$automatic_period_setting"
 
 cargo build --quiet
 
@@ -208,6 +212,7 @@ python3 - \
   "$expected_ni" \
   "$expected_shifted_punctuation" \
   "$expected_shi" \
+  "$expected_zhongguoren" \
   "$input_source_helper" \
   "$listener_log" <<'PY'
 import json
@@ -225,8 +230,9 @@ expected_second_segment = sys.argv[5]
 expected_ni = sys.argv[6]
 expected_shifted_punctuation = sys.argv[7]
 expected_shi = sys.argv[8]
-input_source_helper = sys.argv[9]
-listener_log = pathlib.Path(sys.argv[10])
+expected_zhongguoren = sys.argv[9]
+input_source_helper = sys.argv[10]
+listener_log = pathlib.Path(sys.argv[11])
 settle_seconds = float(os.environ.get("RIME_POC_BEHAVIOR_SETTLE_SECONDS", "10"))
 exit_backspaces = max(1, len(trigger_prefix))
 sentinel = "1234"
@@ -395,6 +401,17 @@ actual = wait_for(sentinel + expected_shifted_punctuation + expected_ni)
 if actual != sentinel + expected_shifted_punctuation + expected_ni:
     raise SystemExit("session did not remain active after shifted punctuation")
 
+start_session_after_sentinel()
+type_text("ni  ")
+expected_double_space = sentinel + expected_ni + " "
+actual = wait_for(expected_double_space)
+if actual != expected_double_space or "." in actual[len(sentinel):]:
+    raise SystemExit(
+        "pinyin commit Space armed macOS double-space period substitution\n"
+        f"expected: {expected_double_space!r}\n"
+        f"actual:   {actual!r}"
+    )
+
 literal_text = "1=-`!"
 start_session_after_sentinel()
 type_text(literal_text)
@@ -453,6 +470,26 @@ type_text("ni ")
 actual = wait_for(sentinel + expected_shi + expected_ni)
 if actual != sentinel + expected_shi + expected_ni:
     raise SystemExit("candidate selection did not keep the recognition session active")
+
+start_session_after_sentinel()
+type_text("woshizhongguoren3")
+expected_partial = sentinel + "我是" + "zhongguoren"
+actual = wait_for(expected_partial)
+if actual != expected_partial:
+    raise SystemExit(
+        "partial candidate selection discarded or misrendered remaining pinyin\n"
+        f"expected: {expected_partial}\n"
+        f"actual:   {actual}"
+    )
+type_text("1")
+expected_continuous = sentinel + "我是" + expected_zhongguoren
+actual = wait_for(expected_continuous)
+if actual != expected_continuous:
+    raise SystemExit(
+        "continuous candidate selection did not convert the remaining pinyin\n"
+        f"expected: {expected_continuous}\n"
+        f"actual:   {actual}"
+    )
 
 start_session_after_sentinel()
 type_text("shi=-1")

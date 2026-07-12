@@ -35,16 +35,16 @@ default_shared_data_dir() {
 
 toml_string() {
   local key="$1"
-  sed -n "s/^[[:space:]]*$key[[:space:]]*=[[:space:]]*\"\\(.*\\)\"[[:space:]]*$/\\1/p" rime-poc.toml | head -n 1
+  sed -n "s/^[[:space:]]*$key[[:space:]]*=[[:space:]]*\"\\(.*\\)\"[[:space:]]*$/\\1/p" pinyin.toml | head -n 1
 }
 
 export RIME_INCLUDE_DIR="${RIME_INCLUDE_DIR:-$(brew --prefix librime)/include}"
 export RIME_LIB_DIR="${RIME_LIB_DIR:-$(brew --prefix librime)/lib}"
 export RIME_SHARED_DATA_DIR="${RIME_SHARED_DATA_DIR:-$(default_shared_data_dir)}"
 export RIME_SCHEMA="${RIME_SCHEMA:-luna_pinyin_simp}"
-export CARGO_HOME="${CARGO_HOME:-/private/tmp/pal-cargo-home-rime-poc}"
-export RIME_POC_SKIP_OPEN_SETTINGS=1
-export RIME_POC_NATIVE_LOG_EVENTS=1
+export CARGO_HOME="${CARGO_HOME:-/private/tmp/pal-cargo-home-pinyin}"
+export PINYIN_SKIP_OPEN_SETTINGS=1
+export PINYIN_NATIVE_LOG_EVENTS=1
 
 if [[ ! -f "$RIME_INCLUDE_DIR/rime_api.h" ]]; then
   echo "error: rime_api.h not found under RIME_INCLUDE_DIR=$RIME_INCLUDE_DIR" >&2
@@ -58,32 +58,32 @@ if [[ ! -d "$RIME_SHARED_DATA_DIR" ]]; then
   exit 1
 fi
 
-trigger_prefix="${RIME_POC_TEST_TRIGGER_PREFIX:-$(toml_string trigger_prefix)}"
+trigger_prefix="${PINYIN_TEST_TRIGGER_PREFIX:-$(toml_string trigger_prefix)}"
 if [[ -z "$trigger_prefix" ]]; then
-  echo "error: unable to read trigger_prefix from rime-poc.toml" >&2
+  echo "error: unable to read trigger_prefix from pinyin.toml" >&2
   exit 1
 fi
 
-if [[ "${RIME_POC_ALLOW_EXISTING_LISTENER:-0}" != "1" ]]; then
-  existing_listeners="$(pgrep -fl "[r]ime-poc --listen" || true)"
+if [[ "${PINYIN_ALLOW_EXISTING_LISTENER:-0}" != "1" ]]; then
+  existing_listeners="$(pgrep -fl "[p]inyin --listen" || true)"
   if [[ -n "$existing_listeners" ]]; then
-    echo "error: an existing rime-poc listener is already running" >&2
+    echo "error: an existing pinyin listener is already running" >&2
     echo "$existing_listeners" >&2
-    echo "hint: stop it first, or set RIME_POC_ALLOW_EXISTING_LISTENER=1 if isolation is not required" >&2
+    echo "hint: stop it first, or set PINYIN_ALLOW_EXISTING_LISTENER=1 if isolation is not required" >&2
     exit 1
   fi
 fi
 
 cleanup_user_data_dir=""
 if [[ -z "${RIME_USER_DATA_DIR:-}" ]]; then
-  cleanup_user_data_dir="$(mktemp -d "${TMPDIR:-/tmp}/rime-poc-stress-user.XXXXXX")"
+  cleanup_user_data_dir="$(mktemp -d "${TMPDIR:-/tmp}/pinyin-stress-user.XXXXXX")"
   export RIME_USER_DATA_DIR="$cleanup_user_data_dir"
   if [[ -f "$PWD/data/user/default.custom.yaml" ]]; then
     cp "$PWD/data/user/default.custom.yaml" "$RIME_USER_DATA_DIR/default.custom.yaml"
   fi
 fi
 
-work_dir="$(mktemp -d "${TMPDIR:-/tmp}/rime-poc-stress.XXXXXX")"
+work_dir="$(mktemp -d "${TMPDIR:-/tmp}/pinyin-stress.XXXXXX")"
 listener_log="$work_dir/listener.log"
 actual_file="$work_dir/actual.txt"
 expected_file="$work_dir/expected.txt"
@@ -104,7 +104,7 @@ cleanup() {
   if [[ -n "$cleanup_user_data_dir" ]]; then
     rm -rf "$cleanup_user_data_dir"
   fi
-  if [[ "${RIME_POC_KEEP_STRESS_ARTIFACTS:-0}" != "1" ]]; then
+  if [[ "${PINYIN_KEEP_STRESS_ARTIFACTS:-0}" != "1" ]]; then
     rm -rf "$work_dir"
   else
     echo "kept stress artifacts: $work_dir" >&2
@@ -195,12 +195,12 @@ printf '%s' "$expected" > "$expected_file"
 
 cargo build --quiet
 
-target/debug/rime-poc --listen --log-events --inject-delay-ms "${RIME_POC_STRESS_INJECT_DELAY_MS:-1}" >"$listener_log" 2>&1 &
+target/debug/pinyin --listen --log-events --inject-delay-ms "${PINYIN_STRESS_INJECT_DELAY_MS:-1}" >"$listener_log" 2>&1 &
 listener_pid="$!"
 echo "$listener_pid" > "$pid_file"
 
 for _ in {1..80}; do
-  if grep -q "rime-poc listener started" "$listener_log"; then
+  if grep -q "pinyin listener started" "$listener_log"; then
     break
   fi
   if ! kill -0 "$listener_pid" 2>/dev/null; then
@@ -211,7 +211,7 @@ for _ in {1..80}; do
   sleep 0.1
 done
 
-if ! grep -q "rime-poc listener started" "$listener_log"; then
+if ! grep -q "pinyin listener started" "$listener_log"; then
   echo "listener did not start in time" >&2
   cat "$listener_log" >&2
   exit 1
@@ -228,7 +228,7 @@ input_text = pathlib.Path(sys.argv[1]).read_text()
 actual_path = pathlib.Path(sys.argv[2])
 expected_text = pathlib.Path(sys.argv[3]).read_text()
 input_source_helper = sys.argv[4]
-settle_seconds = float(os.environ.get("RIME_POC_STRESS_SETTLE_SECONDS", "30"))
+settle_seconds = float(os.environ.get("PINYIN_STRESS_SETTLE_SECONDS", "30"))
 
 prepare_script = r'''
   tell application "TextEdit"
@@ -292,7 +292,7 @@ if [[ "$actual" != "$expected" ]]; then
   echo "listener log: $listener_log" >&2
   echo "--- listener log tail ---" >&2
   tail -n 220 "$listener_log" >&2 || true
-  RIME_POC_KEEP_STRESS_ARTIFACTS=1
+  PINYIN_KEEP_STRESS_ARTIFACTS=1
   exit 1
 fi
 

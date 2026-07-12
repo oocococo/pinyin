@@ -37,9 +37,9 @@ export RIME_INCLUDE_DIR="${RIME_INCLUDE_DIR:-$(brew --prefix librime)/include}"
 export RIME_LIB_DIR="${RIME_LIB_DIR:-$(brew --prefix librime)/lib}"
 export RIME_SHARED_DATA_DIR="${RIME_SHARED_DATA_DIR:-$(default_shared_data_dir)}"
 export RIME_SCHEMA="${RIME_SCHEMA:-luna_pinyin_simp}"
-export CARGO_HOME="${CARGO_HOME:-/private/tmp/pal-cargo-home-rime-poc}"
-export RIME_POC_SKIP_OPEN_SETTINGS=1
-export RIME_POC_NATIVE_LOG_EVENTS=1
+export CARGO_HOME="${CARGO_HOME:-/private/tmp/pal-cargo-home-pinyin}"
+export PINYIN_SKIP_OPEN_SETTINGS=1
+export PINYIN_NATIVE_LOG_EVENTS=1
 
 if [[ ! -f "$RIME_INCLUDE_DIR/rime_api.h" ]]; then
   echo "error: rime_api.h not found under RIME_INCLUDE_DIR=$RIME_INCLUDE_DIR" >&2
@@ -52,36 +52,36 @@ if [[ ! -d "$RIME_SHARED_DATA_DIR" ]]; then
   exit 1
 fi
 
-trigger_prefix="${RIME_POC_TEST_TRIGGER_PREFIX:-;;}"
+trigger_prefix="${PINYIN_TEST_TRIGGER_PREFIX-''}"
 if [[ -z "$trigger_prefix" ]]; then
-  echo "error: RIME_POC_TEST_TRIGGER_PREFIX must not be empty" >&2
+  echo "error: PINYIN_TEST_TRIGGER_PREFIX must not be empty" >&2
   exit 1
 fi
 
-if [[ "${RIME_POC_ALLOW_EXISTING_LISTENER:-0}" != "1" ]]; then
-  existing_listeners="$(pgrep -fl "[r]ime-poc --listen" || true)"
+if [[ "${PINYIN_ALLOW_EXISTING_LISTENER:-0}" != "1" ]]; then
+  existing_listeners="$(pgrep -fl "[p]inyin --listen" || true)"
   if [[ -n "$existing_listeners" ]]; then
-    echo "error: an existing rime-poc listener is already running" >&2
+    echo "error: an existing pinyin listener is already running" >&2
     echo "$existing_listeners" >&2
-    echo "hint: stop it first, or set RIME_POC_ALLOW_EXISTING_LISTENER=1 if isolation is not required" >&2
+    echo "hint: stop it first, or set PINYIN_ALLOW_EXISTING_LISTENER=1 if isolation is not required" >&2
     exit 1
   fi
 fi
 
 cleanup_user_data_dir=""
 if [[ -z "${RIME_USER_DATA_DIR:-}" ]]; then
-  cleanup_user_data_dir="$(mktemp -d "${TMPDIR:-/tmp}/rime-poc-behavior-user.XXXXXX")"
+  cleanup_user_data_dir="$(mktemp -d "${TMPDIR:-/tmp}/pinyin-behavior-user.XXXXXX")"
   export RIME_USER_DATA_DIR="$cleanup_user_data_dir"
   if [[ -f "$PWD/data/user/default.custom.yaml" ]]; then
     cp "$PWD/data/user/default.custom.yaml" "$RIME_USER_DATA_DIR/default.custom.yaml"
   fi
 fi
 
-work_dir="$(mktemp -d "${TMPDIR:-/tmp}/rime-poc-behavior.XXXXXX")"
+work_dir="$(mktemp -d "${TMPDIR:-/tmp}/pinyin-behavior.XXXXXX")"
 listener_log="$work_dir/listener.log"
 pid_file="$work_dir/listener.pid"
 input_source_helper="$work_dir/select-system-input-source"
-listener_config="$work_dir/rime-poc.toml"
+listener_config="$work_dir/pinyin.toml"
 
 cleanup() {
   if [[ -f "$pid_file" ]]; then
@@ -96,7 +96,7 @@ cleanup() {
   if [[ -n "$cleanup_user_data_dir" ]]; then
     rm -rf "$cleanup_user_data_dir"
   fi
-  if [[ "${RIME_POC_KEEP_BEHAVIOR_ARTIFACTS:-0}" != "1" ]]; then
+  if [[ "${PINYIN_KEEP_BEHAVIOR_ARTIFACTS:-0}" != "1" ]]; then
     rm -rf "$work_dir"
   else
     echo "kept behavior artifacts: $work_dir" >&2
@@ -104,7 +104,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-python3 - "$PWD/rime-poc.toml" "$listener_config" "$trigger_prefix" <<'PY'
+python3 - "$PWD/pinyin.toml" "$listener_config" "$trigger_prefix" <<'PY'
 import json
 import re
 import sys
@@ -129,7 +129,7 @@ config = re.sub(
 with open(destination_path, "w", encoding="utf-8") as destination:
     destination.write(config)
 PY
-export RIME_POC_CONFIG="$listener_config"
+export PINYIN_CONFIG="$listener_config"
 
 cat > "$work_dir/select-system-input-source.mm" <<'MM'
 #import <Carbon/Carbon.h>
@@ -181,12 +181,12 @@ echo "NSAutomaticPeriodSubstitutionEnabled=$automatic_period_setting"
 
 cargo build --quiet
 
-target/debug/rime-poc --listen --log-events --inject-delay-ms "${RIME_POC_BEHAVIOR_INJECT_DELAY_MS:-1}" >"$listener_log" 2>&1 &
+target/debug/pinyin --listen --log-events --inject-delay-ms "${PINYIN_BEHAVIOR_INJECT_DELAY_MS:-1}" >"$listener_log" 2>&1 &
 listener_pid="$!"
 echo "$listener_pid" > "$pid_file"
 
 for _ in {1..80}; do
-  if grep -q "rime-poc listener started" "$listener_log"; then
+  if grep -q "pinyin listener started" "$listener_log"; then
     break
   fi
   if ! kill -0 "$listener_pid" 2>/dev/null; then
@@ -197,7 +197,7 @@ for _ in {1..80}; do
   sleep 0.1
 done
 
-if ! grep -q "rime-poc listener started" "$listener_log"; then
+if ! grep -q "pinyin listener started" "$listener_log"; then
   echo "listener did not start in time" >&2
   cat "$listener_log" >&2
   exit 1
@@ -233,7 +233,7 @@ expected_shi = sys.argv[8]
 expected_zhongguoren = sys.argv[9]
 input_source_helper = sys.argv[10]
 listener_log = pathlib.Path(sys.argv[11])
-settle_seconds = float(os.environ.get("RIME_POC_BEHAVIOR_SETTLE_SECONDS", "10"))
+settle_seconds = float(os.environ.get("PINYIN_BEHAVIOR_SETTLE_SECONDS", "10"))
 exit_backspaces = max(1, len(trigger_prefix))
 sentinel = "1234"
 

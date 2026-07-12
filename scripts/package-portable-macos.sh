@@ -8,26 +8,35 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
   exit 1
 fi
 
-for tool in otool install_name_tool ditto codesign; do
+for tool in otool install_name_tool ditto codesign realpath; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "error: required tool not found: $tool" >&2
     exit 1
   fi
 done
 
+version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+case "$(uname -m)" in
+  arm64) architecture="arm64" ;;
+  x86_64) architecture="x86_64" ;;
+  *)
+    echo "error: unsupported macOS architecture: $(uname -m)" >&2
+    exit 1
+    ;;
+esac
+
+package_name="pinyin-v${version}-macos-${architecture}"
+portable_dir="$PWD/dist/$package_name"
+zip_path="$PWD/dist/$package_name.zip"
+lib_dir="$portable_dir/lib"
+exe="$portable_dir/pinyin"
+
 bash scripts/package-binary.sh
 
-base_dir="$PWD/dist/rime-poc-macos"
-portable_dir="$PWD/dist/rime-poc-macos-portable"
-zip_path="$PWD/dist/rime-poc-macos-portable.zip"
-lib_dir="$portable_dir/lib"
-exe="$portable_dir/rime-poc"
-
-rm -rf "$portable_dir" "$zip_path"
-ditto "$base_dir" "$portable_dir"
+rm -f "$zip_path"
 mkdir -p "$lib_dir"
 
-tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/rime-poc-portable.XXXXXX")"
+tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/pinyin-portable.XXXXXX")"
 trap 'rm -rf "$tmp_dir"' EXIT
 
 queue_file="$tmp_dir/queue"
@@ -37,17 +46,17 @@ map_file="$tmp_dir/dep-map"
 : > "$map_file"
 printf '%s\n' "$exe" > "$queue_file"
 
-portable_dep() {
+portable_dependency() {
   case "$1" in
     /opt/homebrew/*|/usr/local/*) return 0 ;;
     *) return 1 ;;
   esac
 }
 
-list_portable_deps() {
-  otool -L "$1" | awk 'NR > 1 { print $1 }' | while IFS= read -r dep; do
-    if portable_dep "$dep"; then
-      printf '%s\n' "$dep"
+list_portable_dependencies() {
+  otool -L "$1" | awk 'NR > 1 { print $1 }' | while IFS= read -r dependency; do
+    if portable_dependency "$dependency"; then
+      printf '%s\n' "$dependency"
     fi
   done
 }
@@ -57,36 +66,34 @@ while [[ -s "$queue_file" ]]; do
   sed '1d' "$queue_file" > "$queue_file.next"
   mv "$queue_file.next" "$queue_file"
 
-  while IFS= read -r dep; do
-    [[ -n "$dep" ]] || continue
+  while IFS= read -r dependency; do
+    [[ -n "$dependency" ]] || continue
 
-    if [[ ! -f "$dep" ]]; then
-      echo "error: dependency not found: $dep" >&2
+    if [[ ! -f "$dependency" ]]; then
+      echo "error: dependency not found: $dependency" >&2
       exit 1
     fi
 
-    if grep -Fqx "$dep" "$seen_file"; then
+    if grep -Fqx "$dependency" "$seen_file"; then
       continue
     fi
 
-    base="$(basename "$dep")"
-    existing="$(
-      awk -F '\t' -v base="$base" '$2 == base { print $1; exit }' "$map_file"
-    )"
-    if [[ -n "$existing" && "$existing" != "$dep" ]]; then
+    base="$(basename "$dependency")"
+    existing="$(awk -F '\t' -v base="$base" '$2 == base { print $1; exit }' "$map_file")"
+    if [[ -n "$existing" && "$existing" != "$dependency" ]]; then
       echo "error: dependency basename collision:" >&2
       echo "  $existing" >&2
-      echo "  $dep" >&2
+      echo "  $dependency" >&2
       exit 1
     fi
 
-    install -m 755 "$dep" "$lib_dir/$base"
+    install -m 755 "$dependency" "$lib_dir/$base"
     chmod u+w "$lib_dir/$base"
 
-    printf '%s\n' "$dep" >> "$seen_file"
-    printf '%s\t%s\n' "$dep" "$base" >> "$map_file"
+    printf '%s\n' "$dependency" >> "$seen_file"
+    printf '%s\t%s\n' "$dependency" "$base" >> "$map_file"
     printf '%s\n' "$lib_dir/$base" >> "$queue_file"
-  done < <(list_portable_deps "$image")
+  done < <(list_portable_dependencies "$image")
 done
 
 if [[ ! -s "$map_file" ]]; then
@@ -106,10 +113,10 @@ targets_file="$tmp_dir/targets"
 printf '%s\n' "$exe" > "$targets_file"
 find "$lib_dir" -maxdepth 1 -type f -name '*.dylib' -print | sort >> "$targets_file"
 
-while IFS= read -r lib; do
-  [[ "$lib" != "$exe" ]] || continue
-  install_name_tool -id "@rpath/$(basename "$lib")" "$lib"
-  install_name_tool -add_rpath "@loader_path" "$lib" 2>/dev/null || true
+while IFS= read -r library; do
+  [[ "$library" != "$exe" ]] || continue
+  install_name_tool -id "@rpath/$(basename "$library")" "$library"
+  install_name_tool -add_rpath "@loader_path" "$library" 2>/dev/null || true
 done < "$targets_file"
 
 while IFS= read -r target; do
@@ -147,7 +154,7 @@ export RIME_SHARED_DATA_DIR="${RIME_SHARED_DATA_DIR:-$PWD/data/shared}"
 export RIME_USER_DATA_DIR="${RIME_USER_DATA_DIR:-$PWD/data/user}"
 export RIME_SCHEMA="${RIME_SCHEMA:-luna_pinyin_simp}"
 
-exec "$PWD/rime-poc" --listen "$@"
+exec "$PWD/pinyin" --listen "$@"
 RUN_LISTENER
 chmod +x "$portable_dir/run-listener.sh"
 
@@ -161,68 +168,35 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 export RIME_SHARED_DATA_DIR="${RIME_SHARED_DATA_DIR:-$PWD/data/shared}"
 export RIME_USER_DATA_DIR="${RIME_USER_DATA_DIR:-$PWD/data/user}"
 export RIME_SCHEMA="${RIME_SCHEMA:-luna_pinyin_simp}"
-export RIME_POC_NATIVE_LOG_EVENTS="${RIME_POC_NATIVE_LOG_EVENTS:-1}"
+export PINYIN_NATIVE_LOG_EVENTS="${PINYIN_NATIVE_LOG_EVENTS:-1}"
 
-log_dir="${RIME_POC_LOG_DIR:-$PWD/logs}"
+log_dir="${PINYIN_LOG_DIR:-$PWD/logs}"
 mkdir -p "$log_dir"
-log_file="${RIME_POC_LOG_FILE:-$log_dir/rime-poc-listener-$(date +%Y%m%d-%H%M%S).log}"
+log_file="${PINYIN_LOG_FILE:-$log_dir/pinyin-listener-$(date +%Y%m%d-%H%M%S).log}"
 
-echo "rime-poc debug listener log:"
+echo "pinyin 调试日志："
 echo "  $log_file"
 echo
 
-"$PWD/rime-poc" --doctor --listen --log-events "$@" 2>&1 | tee -a "$log_file"
+"$PWD/pinyin" --doctor --listen --log-events "$@" 2>&1 | tee -a "$log_file"
 RUN_LISTENER_DEBUG
 chmod +x "$portable_dir/run-listener-debug.sh"
 
-cat > "$portable_dir/README.txt" <<'README'
-rime-poc portable macOS package
+bash scripts/collect-third-party-licenses.sh "$portable_dir" "$map_file"
 
-This directory bundles:
-  - rime-poc
-  - librime and Homebrew dylib dependencies under lib/
-  - Rime shared/user data under data/
-  - rime-poc.toml trigger and conversion config
-
-No Homebrew install is required on the target Mac.
-
-1. Grant macOS permissions to this binary:
-   rime-poc-macos-portable/rime-poc
-
-   Required permissions:
-   - Privacy & Security > Accessibility
-   - Privacy & Security > Input Monitoring
-
-2. Start the listener:
-   ./run-listener.sh
-
-   For diagnosis with event logs:
-   ./run-listener-debug.sh
-
-3. Type a trigger in any text field:
-   ;;woyaoceshizhongwenshurufa,nihaoma!;;
-
-Expected output:
-   我要测试中文输入法，你好吗！
-
-Experimental mixed Chinese/English mode:
-   ./run-listener.sh --conversion-mode rime-auto
-
-Or edit rime-poc.toml:
-   conversion_mode = "rime-auto"
-
-Notes:
-  - macOS permissions cannot be pre-granted by this package.
-  - If Gatekeeper blocks the binary, a signed/notarized .app/.dmg is the next
-    packaging step.
-README
-
-"$exe" --body 'woyaoceshi,nihaoma!' >/dev/null
-"$exe" --body --conversion-mode rime-auto 'wo ai OpenAI,yong Rust kaifa' >/dev/null
+export RIME_SHARED_DATA_DIR="$portable_dir/data/shared"
+smoke_user_dir="$tmp_dir/smoke-user"
+mkdir -p "$smoke_user_dir"
+if [[ -f "$portable_dir/data/user/default.custom.yaml" ]]; then
+  cp "$portable_dir/data/user/default.custom.yaml" "$smoke_user_dir/default.custom.yaml"
+fi
+export RIME_USER_DATA_DIR="$smoke_user_dir"
+export RIME_SCHEMA=luna_pinyin_simp
+"$exe" --body nihao >/dev/null
 
 (
   cd "$PWD/dist"
-  ditto -c -k --keepParent "$(basename "$portable_dir")" "$(basename "$zip_path")"
+  ditto -c -k --keepParent "$package_name" "$package_name.zip"
 )
 
 echo "Portable package:"
@@ -230,6 +204,3 @@ echo "  $portable_dir"
 echo
 echo "Portable zip:"
 echo "  $zip_path"
-echo
-echo "Bundled dylibs:"
-awk -F '\t' '{ print "  " $2 }' "$map_file" | sort

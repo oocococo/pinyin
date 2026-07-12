@@ -33,7 +33,7 @@ export RIME_LIB_DIR="${RIME_LIB_DIR:-$(brew --prefix librime)/lib}"
 export RIME_SHARED_DATA_DIR="${RIME_SHARED_DATA_DIR:-$(default_shared_data_dir)}"
 export RIME_USER_DATA_DIR="${RIME_USER_DATA_DIR:-$PWD/data/user}"
 export RIME_SCHEMA="${RIME_SCHEMA:-luna_pinyin_simp}"
-export CARGO_HOME="${CARGO_HOME:-/private/tmp/pal-cargo-home-rime-poc}"
+export CARGO_HOME="${CARGO_HOME:-/private/tmp/pal-cargo-home-pinyin}"
 
 if [[ ! -f "$RIME_INCLUDE_DIR/rime_api.h" ]]; then
   echo "error: rime_api.h not found under RIME_INCLUDE_DIR=$RIME_INCLUDE_DIR" >&2

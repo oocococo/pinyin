@@ -34,8 +34,8 @@ export RIME_LIB_DIR="${RIME_LIB_DIR:-$(brew --prefix librime)/lib}"
 export RIME_SHARED_DATA_DIR="${RIME_SHARED_DATA_DIR:-$(default_shared_data_dir)}"
 export RIME_USER_DATA_DIR="${RIME_USER_DATA_DIR:-$PWD/data/user}"
 export RIME_SCHEMA="${RIME_SCHEMA:-luna_pinyin_simp}"
-export CARGO_HOME="${CARGO_HOME:-/private/tmp/pal-cargo-home-rime-poc}"
-export RIME_POC_NATIVE_LOG_EVENTS="${RIME_POC_NATIVE_LOG_EVENTS:-1}"
+export CARGO_HOME="${CARGO_HOME:-/private/tmp/pal-cargo-home-pinyin}"
+export PINYIN_NATIVE_LOG_EVENTS="${PINYIN_NATIVE_LOG_EVENTS:-1}"
 
 if [[ ! -f "$RIME_INCLUDE_DIR/rime_api.h" ]]; then
   echo "error: rime_api.h not found under RIME_INCLUDE_DIR=$RIME_INCLUDE_DIR" >&2
@@ -50,11 +50,11 @@ if [[ ! -d "$RIME_SHARED_DATA_DIR" ]]; then
   exit 1
 fi
 
-log_dir="${RIME_POC_LOG_DIR:-$PWD/logs}"
+log_dir="${PINYIN_LOG_DIR:-$PWD/logs}"
 mkdir -p "$log_dir"
-log_file="${RIME_POC_LOG_FILE:-$log_dir/rime-poc-listener-$(date +%Y%m%d-%H%M%S).log}"
+log_file="${PINYIN_LOG_FILE:-$log_dir/pinyin-listener-$(date +%Y%m%d-%H%M%S).log}"
 
-echo "rime-poc debug listener log:"
+echo "pinyin debug listener log:"
 echo "  $log_file"
 echo
 

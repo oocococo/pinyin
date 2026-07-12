@@ -2,7 +2,7 @@
 set -euo pipefail
 
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-data_dir="${RIME_POC_DATA_DIR:-$root_dir/data}"
+data_dir="${PINYIN_DATA_DIR:-$root_dir/data}"
 package_dir="$data_dir/packages"
 shared_dir="$data_dir/shared"
 user_dir="$data_dir/user"

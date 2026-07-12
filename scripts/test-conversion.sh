@@ -30,20 +30,20 @@ default_shared_data_dir() {
 
 toml_string() {
   local key="$1"
-  sed -n "s/^[[:space:]]*$key[[:space:]]*=[[:space:]]*\"\\(.*\\)\"[[:space:]]*$/\\1/p" rime-poc.toml | head -n 1
+  sed -n "s/^[[:space:]]*$key[[:space:]]*=[[:space:]]*\"\\(.*\\)\"[[:space:]]*$/\\1/p" pinyin.toml | head -n 1
 }
 
 export RIME_INCLUDE_DIR="${RIME_INCLUDE_DIR:-$(brew --prefix librime)/include}"
 export RIME_LIB_DIR="${RIME_LIB_DIR:-$(brew --prefix librime)/lib}"
 export RIME_SHARED_DATA_DIR="${RIME_SHARED_DATA_DIR:-$(default_shared_data_dir)}"
 export RIME_SCHEMA="${RIME_SCHEMA:-luna_pinyin_simp}"
-export CARGO_HOME="${CARGO_HOME:-/private/tmp/pal-cargo-home-rime-poc}"
-trigger_prefix="${RIME_POC_TEST_TRIGGER_PREFIX:-$(toml_string trigger_prefix)}"
-trigger_suffix="${RIME_POC_TEST_TRIGGER_SUFFIX:-$(toml_string trigger_suffix)}"
+export CARGO_HOME="${CARGO_HOME:-/private/tmp/pal-cargo-home-pinyin}"
+trigger_prefix="${PINYIN_TEST_TRIGGER_PREFIX:-$(toml_string trigger_prefix)}"
+trigger_suffix="${PINYIN_TEST_TRIGGER_SUFFIX:-$(toml_string trigger_suffix)}"
 
 cleanup_user_data_dir=""
 if [[ -z "${RIME_USER_DATA_DIR:-}" ]]; then
-  cleanup_user_data_dir="$(mktemp -d "${TMPDIR:-/tmp}/rime-poc-test-user.XXXXXX")"
+  cleanup_user_data_dir="$(mktemp -d "${TMPDIR:-/tmp}/pinyin-test-user.XXXXXX")"
   export RIME_USER_DATA_DIR="$cleanup_user_data_dir"
   if [[ -f "$PWD/data/user/default.custom.yaml" ]]; then
     cp "$PWD/data/user/default.custom.yaml" "$RIME_USER_DATA_DIR/default.custom.yaml"
@@ -67,7 +67,7 @@ if [[ ! -d "$RIME_SHARED_DATA_DIR" ]]; then
 fi
 
 if [[ -z "$trigger_prefix" || -z "$trigger_suffix" ]]; then
-  echo "error: unable to read trigger_prefix/trigger_suffix from rime-poc.toml" >&2
+  echo "error: unable to read trigger_prefix/trigger_suffix from pinyin.toml" >&2
   exit 1
 fi
 

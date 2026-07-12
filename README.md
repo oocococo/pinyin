@@ -1,61 +1,102 @@
-# rime-poc
+# pinyin
 
-Minimal PoC for calling `librime` from Rust, converting captured pinyin into
-the first Rime candidate, and running a macOS listener that deletes the trigger
-text and injects the converted result.
+**保持英文输入源，只在需要时用前缀唤起中文拼音。**
 
-This is intentionally separate from the espanso workspace. It only validates
-the first usable flow before moving anything into a real product repository.
+pinyin 是一款面向 macOS 的前缀式中文输入工具。它不要求你在中文、英文输入法之间反复切换：平时继续使用系统英文输入源，写代码、操作终端和触发快捷键；需要手动输入中文时，键入前缀进入拼音模式，完成后再用同一字符串退出。
 
-## Prerequisites
+```text
+始终保持 macOS 的 ABC 输入源：
 
-Install `librime` and Rime schema data first. On macOS, the fastest dev setup is:
-
-```sh
-brew install librime
+''nihao<空格>shijie<空格>''
+                ↓
+              你好世界
 ```
 
-Check that it is actually installed before exporting paths. `brew --prefix
-librime` can print the theoretical prefix even when the formula is not
-installed.
+默认的进入与退出字符串都是两个英文单引号：`''`。
 
-```sh
-brew list --versions librime
-test -f "$(brew --prefix librime)/include/rime_api.h"
-test -f "$(brew --prefix librime)/lib/librime.dylib"
+> pinyin 想解决的不是“怎样更快地切换中英文输入法”，而是“能不能尽量不切换输入法”。
+
+## 它适合谁
+
+pinyin 尤其适合这些使用习惯：
+
+- 大部分时间写代码、使用终端或操作键盘快捷键；
+- 偶尔需要手动回复中文消息，但中文输入并不是主要工作负载；
+- 希望中文输入由一次明确的前缀触发，而不是依赖当前输入法状态；
+- 不喜欢 Shift 切换或按应用自动切换带来的状态猜测和意外卡顿。
+
+如果你每天需要长时间、连续地输入中文，传统中文输入法通常会更高效。pinyin 更关注“英文为主、中文偶发”的场景。
+
+## 核心特性
+
+- **前缀模式**：只有检测到指定前缀后才接管拼音输入，未激活时不影响普通字母和终端快捷键。
+- **Rime 候选**：使用 Rime 提供拼音转换与候选结果，支持数字选词和候选翻页。
+- **边输入边转换**：按空格即可提交当前候选，无需等到退出字符串出现后再统一转换。
+- **同串退出**：再次键入触发字符串即可结束本次中文输入，回到纯英文键盘行为。
+- **中英文混输**：可随时把当前字母按原始英文提交；另提供实验性的 Rime 自动混输模式。
+- **本地处理**：核心监听和拼音转换均在本机完成，不会把输入内容发送到远程服务。
+- **可配置**：进入/退出字符串、候选数量、布局、选词键、翻页键和英文提交键均可调整。
+
+## 下载与安装
+
+> 目前仅支持 macOS。
+
+普通用户推荐使用便携包，不需要在目标 Mac 上安装 Rust、Homebrew 或 librime。
+
+1. 打开 [GitHub Releases](https://github.com/oocococo/pinyin/releases)，下载最新的 macOS portable 压缩包。
+2. 解压后，在终端进入该目录并启动监听器：
+
+   ```sh
+   ./run-listener.sh
+   ```
+
+3. 按程序提示，在“系统设置 → 隐私与安全性”中为压缩包内的主程序开启：
+
+   - 辅助功能；
+   - 输入监控。
+
+4. 授权后退出并重新运行 `./run-listener.sh`。保持这个进程运行，即可在其他应用中使用 pinyin。
+
+便携包已经包含 librime、运行所需的动态库和基础 Rime 数据。macOS 权限必须由用户在每台设备上手动授予；当前构建尚未经过 Apple 公证，如果系统拦截首次启动，请在“隐私与安全性”中确认允许打开。
+
+## 第一次输入
+
+1. 确认当前使用的是 macOS 自带的英文输入源，例如 `ABC`。
+2. 在任意普通文本输入区域键入 `''`，触发字符会被删除，同时出现候选面板。
+3. 输入 `nihao`，按空格提交首选候选：`你好`。
+4. 继续输入其他拼音，或再次键入 `''` 退出中文输入。
+
+完整示例：
+
+```text
+输入：''woyaoceshizhongwenshurufa<空格>nihaoma?''
+结果：我要测试中文输入法你好吗？
 ```
 
-The Rust FFI crate looks in `/usr/include` and `/usr/lib` by default. For a
-Homebrew install, point it at the formula paths when building:
+## 常用操作
 
-```sh
-export RIME_INCLUDE_DIR="$(brew --prefix librime)/include"
-export RIME_LIB_DIR="$(brew --prefix librime)/lib"
-```
+| 按键 | 默认行为 |
+| --- | --- |
+| `''` | 进入或退出中文输入 |
+| `空格` | 选择当前候选页的第一个候选 |
+| `1`–`0` | 选择对应位置的候选词 |
+| `=` / `-` | 下一页 / 上一页候选 |
+| `` ` `` | 将当前未提交的字母原样作为英文提交 |
+| `Backspace` | 编辑当前拼音；紧跟转换后按下可恢复原始拼音 |
+| `Control-W` | 删除当前缓冲区中的上一个拼音词 |
 
-You also need Rime data such as `prelude`, `essay`, and either `luna-pinyin` or
-`pinyin-simp`. Point the CLI at those directories with:
+逗号、句号、问号、感叹号等常见半角标点会在中文输入过程中映射为对应的中文标点。候选面板支持横向和纵向布局，默认横向显示 5 个候选。
 
-```sh
-export RIME_SHARED_DATA_DIR=/path/to/rime-data
-export RIME_USER_DATA_DIR="$HOME/Library/Rime"
-export RIME_SCHEMA=luna_pinyin_simp
-```
+## 配置
 
-When using Squirrel's installed data, the shared directory is commonly:
-
-```sh
-/Library/Input Methods/Squirrel.app/Contents/SharedSupport
-```
-
-## Trigger config
-
-The first-version matcher reads trigger strings from `rime-poc.toml` in the
-current directory, or from `--config <FILE>` / `RIME_POC_CONFIG`:
+编辑便携包或仓库根目录中的 TOML 配置文件，然后重新启动监听器：
 
 ```toml
-trigger_prefix = ";;"
-trigger_suffix = ";;"
+trigger_prefix = "''"
+trigger_suffix = "''"
+
+conversion_mode = "segmented"
+
 candidate_layout = "horizontal"
 candidate_count = 5
 candidate_select_keys = "1234567890"
@@ -64,308 +105,93 @@ candidate_page_previous_key = "-"
 english_commit_key = "`"
 ```
 
-Trigger strings cannot contain punctuation that is reserved for separating
-pinyin runs inside the body: comma, period, question mark, exclamation mark, minus, plus,
-ellipsis, tilde, or double quote, including common Chinese/full-width variants.
-The listener candidate UI supports `candidate_layout = "horizontal"` or
-`"vertical"`. It shows up to `candidate_count` candidates and labels them with
-`candidate_select_keys`; the count cannot exceed the number of configured
-selection keys. The defaults are a horizontal list with 5 candidates, numeric
-selection keys `1234567890`, `=` for the next page, `-` for the previous page,
-and backtick for committing pending input as raw English.
+### 触发字符串
 
-## Usage
+`trigger_prefix` 和 `trigger_suffix` 可以不同，也可以像默认配置一样使用同一字符串。触发字符串不能包含会被当作拼音分隔符处理的标点，包括逗号、句号、问号、感叹号、减号、加号、省略号、波浪号和双引号，以及它们的中文或全角形式。
+
+### 转换模式
+
+- `segmented`：稳定的默认模式。分别转换拼音片段，并将常见半角标点映射为中文标点。
+- `rime-auto`：实验模式。把整段输入交给 Rime，由当前输入方案决定中文、英文和标点的提交行为。
+
+也可以只在本次启动中覆盖部分设置：
 
 ```sh
-cargo run -- ";;woyaoceshizhongwenshurufa,nihaoma?\"hao...zaijian\";;"
+./run-listener.sh --candidate-layout vertical --candidate-count 8
+./run-listener.sh --conversion-mode rime-auto
 ```
 
-Useful flags:
+## 工作原理
+
+pinyin 不是一个需要切换过去的 macOS 输入源，而是一个全局键盘监听程序。
+
+未激活时，它只等待完整的触发前缀；前缀出现后，它删除触发字符、收集后续拼音，并通过本机的 librime 构建候选。用户提交候选时，pinyin 删除原始拼音并把转换结果写回当前输入区域。退出、切换应用、切换窗口或改变输入源时，本次会话会被清理，避免把一个窗口里的缓冲内容带到另一个窗口。
+
+程序使用 macOS 辅助功能定位输入光标、显示候选面板并完成文本回写，因此必须授予辅助功能和输入监控权限。
+
+## 当前限制
+
+- 仅支持 macOS，暂不支持 Windows 或 Linux。
+- 当前以终端常驻进程运行，尚无菜单栏界面、自动启动和自动更新。
+- 只允许在 macOS 系统输入源下开启会话；第三方输入法即使处于英文模式也不会触发 pinyin。
+- 依赖应用正确暴露辅助功能文本位置；少数应用中候选面板可能退回到输入框或鼠标附近显示。
+- 当前便携构建没有 Apple 公证，首次运行体验仍有改进空间。
+- `rime-auto` 混输模式仍是实验功能，追求可预测行为时请使用默认的 `segmented`。
+
+## 从源码运行
+
+开发环境需要 macOS、Rust、Homebrew 和 librime：
+
+```sh
+brew install librime
+git clone https://github.com/oocococo/pinyin.git
+cd pinyin
+
+bash scripts/download-rime-data.sh
+bash scripts/run-listener.sh
+```
+
+运行依赖与配置检查：
 
 ```sh
 cargo run -- --doctor
-cargo run -- --body "woyaoceshizhongwenshurufa,nihaoma"
-cargo run -- --config ./rime-poc.toml --schema pinyin_simp --shared-data-dir /path/to/rime-data --user-data-dir "$HOME/Library/Rime" ";;woyaoceshi;;"
-```
-
-Run the dependency check without compiling Rust:
-
-```sh
 bash scripts/check-librime.sh
 ```
 
-Run the full local conversion smoke test:
+运行格式检查、测试和本地转换冒烟测试：
 
 ```sh
 bash scripts/test-conversion.sh
 ```
 
-Or pass one trigger text to test a single case:
-
-```sh
-bash scripts/test-conversion.sh ';;"hao","zaijian";;'
-```
-
-Start the macOS listener:
-
-```sh
-bash scripts/run-listener.sh
-```
-
-The listener uses Cocoa global keyboard monitoring and CGEvent injection. macOS
-must grant Accessibility permission to the terminal app or compiled binary. If
-permission is missing, the CLI opens the Accessibility settings page, prints the
-exact next step, and waits for you to press Enter after granting permission. When
-it is running, type a configured trigger such as:
-
-```text
-;;woyaoceshizhongwenshurufa,nihaoma!;;
-```
-
-The listener deletes the full trigger text with Backspace and injects:
-
-```text
-我要测试中文输入法，你好吗！
-```
-
-The listener also supports incremental conversion after the prefix is typed.
-While the session is active, Space or any non-pinyin separator that is not part
-of the configured trigger converts the preceding pinyin immediately, so you do
-not have to wait for the closing trigger. Space acts like a commit key and is
-not reinserted; punctuation separators are kept and mapped where a mapping
-exists. A physical Space used as this commit key is consumed before it reaches
-the host; a following Space is therefore an ordinary first host Space and does
-not trigger macOS's double-space period substitution. The candidate panel
-remains the active-state indicator after committed output. The closing trigger
-only removes pending raw text and the suffix; it does not rewrite earlier
-converted text. Pressing Backspace immediately after an incremental conversion
-restores the original pinyin text for editing.
-The listener separately tracks pending raw text, committed output that still
-belongs to the active session, and the hidden opening prefix. Deleting all
-visible session output therefore keeps the session active until one additional
-Backspace per opening-prefix character has been received. Those final virtual
-Backspaces are consumed by the event tap, so they do not delete text that was
-present before the trigger.
-
-If a pinyin run has no Rime candidate, the listener commits that run unchanged
-instead of treating it as a fatal conversion error. For example, `vke<Space>`
-leaves `vke` as raw text and the listener remains usable. Rewrite transactions
-also have an abort guard: any error before a native rewrite is committed
-restores the logical input and releases/replays buffered keyboard events.
-
-The configured trigger is reserved for state changes: the same configured pair
-enters and exits the active session. Trigger characters such as
-`;` are not treated as incremental separators, avoiding ambiguity between a
-single trigger character and the full trigger. Each opening trigger starts an
-isolated session; text before that trigger is not part of the active capture
-buffer. When the opening trigger is detected, the listener deletes those trigger
-characters and shows a non-activating macOS candidate panel as the active-state
-indicator. As pinyin is typed, the panel shows the current Rime preedit and the
-configured number of candidates. Only ASCII letters and apostrophes enter the
-pending pinyin buffer. While that pending pinyin produces a candidate menu, a
-configured selection key chooses its corresponding available candidate and the
-configured page keys (`=` / `-` by default) move to the next / previous page. A
-selection key is not consumed when its page has no corresponding candidate.
-If the chosen candidate consumes only a prefix of the pinyin, the listener
-commits that selected text, keeps the unconsumed raw pinyin visible, resets to
-candidate page zero, and immediately rebuilds candidates for the remainder.
-Selection can repeat until the pending pinyin is completely consumed.
-Candidate selection and paging keys type normally when there is no pending
-candidate menu and never enter an empty pinyin buffer. If pending letters have
-no Rime menu (for example invalid pinyin), both those letters and the control
-key are committed literally, so `vke-` remains ASCII `vke-`.
-
-The configured English commit key (backtick by default) commits the pending
-pinyin text unchanged whenever it contains an ASCII letter, and consumes only
-the delimiter. With no pending letters it types normally. Shift itself never
-clears the session: an unmodified Shift is a no-op, and shifted text such as
-`Shift+1` continues through the normal `!` punctuation path.
-
-Candidate previews, page changes, and selections use reconstructed short Rime
-sessions. Page navigation calls librime's page API and candidate selection calls
-the current-page selection API; configured host keys are not sent to Rime as a
-schema-dependent shortcut.
-
-The panel is positioned from the macOS Accessibility caret bounds when
-available, including browser text-marker ranges, then falls back to focused
-text-field bounds and finally the mouse anchor. Mouse context changes,
-active application changes, input source
-changes, and Command-Tab/Command-Backtick window switch shortcuts clear the
-active session and hide the panel. The listener also records the macOS input
-source fingerprint when a session opens and verifies it on later key events; if
-the input route changes before conversion, it abandons the internal session
-without deleting or injecting text. Only macOS system input sources with
-`source=com.apple...` are allowed to open or continue a session; third-party
-input methods are ignored even if they are in an English/direct-input mode.
-The listener requires a suppressing CGEvent tap; it stops instead of falling
-back to a passive global monitor if that tap cannot be created. During the short
-rewrite window where the listener deletes raw pinyin and
-injects converted text, the macOS event tap temporarily buffers ordinary typed
-characters and replays them into the active session after the rewrite finishes.
-For separator-triggered conversion, this rewrite transaction starts before the
-separator is handed to the capture state and Rime conversion path. Each
-delete-and-inject rewrite is queued as one native operation; the next rewrite
-does not start until the previous operation has posted its backspaces, posted its
-replacement text, settled briefly, and replayed buffered input. If replayed
-buffered input triggers another rewrite, replay pauses and keeps the remaining
-events queued for the next transaction, so repeated fast conversions stay
-serialized. Outside that rewrite transaction, key events are observed and passed
-through.
-Command-C,
-Control-C, and common Command editing shortcuts abort the session; Control-W
-keeps the session active and removes the previous raw pinyin word from the
-buffer. When the closing trigger exits the session, only the current visible
-marker and pending text are removed or converted.
-
-For example:
-
-```text
-;;woyaoceshi<Space>
-```
-
-leaves the visible text as:
-
-```text
-我要测试
-```
-
-Continuing from that state, typing:
-
-```text
-zhongwenshurufa<Space>
-```
-
-leaves:
-
-```text
-我要测试中文输入法
-```
-
-Typing the closing trigger then removes only the suffix and hides the panel:
-
-```text
-我要测试中文输入法
-```
-
-Useful listener flags:
-
-```sh
-bash scripts/run-listener.sh --max-buffer-chars 4096 --inject-delay-ms 1
-bash scripts/run-listener.sh --candidate-layout vertical --candidate-count 8
-bash scripts/run-listener.sh --log-events
-```
-
-For diagnosis, run the debug wrapper. It prints doctor output, turns on native
-and Rust event logs, and writes the same output to `logs/`:
-
-```sh
-bash scripts/run-listener-debug.sh
-```
-
-Package a standalone release binary directory:
-
-```sh
-bash scripts/package-binary.sh
-```
-
-The package is written to:
-
-```text
-dist/rime-poc-macos
-```
-
-Grant Accessibility permission to this executable, not just the terminal:
-
-```text
-dist/rime-poc-macos/rime-poc
-```
-
-Then run:
-
-```sh
-dist/rime-poc-macos/run-listener.sh
-```
-
-For diagnosis with the packaged binary:
-
-```sh
-dist/rime-poc-macos/run-listener-debug.sh
-```
-
-The debug log is written under:
-
-```text
-dist/rime-poc-macos/logs
-```
-
-Package a portable zip that bundles `librime`, its Homebrew dylib
-dependencies, and the Rime data files:
+构建包含 librime、动态库和 Rime 数据的 macOS 便携包：
 
 ```sh
 bash scripts/package-portable-macos.sh
 ```
 
-The portable directory and zip are written to:
+## 参与贡献
 
-```text
-dist/rime-poc-macos-portable
-dist/rime-poc-macos-portable.zip
-```
+欢迎提交 [Issue](https://github.com/oocococo/pinyin/issues) 或 Pull Request。无论是输入体验、候选交互、Rime 方案兼容、macOS 应用适配、安装分发，还是文档改进，都很有价值。
 
-On the target Mac, unzip it, grant Accessibility and Input Monitoring
-permissions to `rime-poc-macos-portable/rime-poc`, then run:
+报告问题时，建议附上：
 
-```sh
-./run-listener.sh
-```
+- macOS 版本与芯片架构；
+- 使用的系统输入源和目标应用；
+- 可复现的输入序列；
+- `./run-listener-debug.sh` 生成的相关日志。
 
-The portable zip does not require Homebrew on the target Mac. macOS permissions
-still need to be granted per machine.
+日志可能包含按键与输入内容，请在公开提交前先检查并删除敏感信息。
 
-Download minimal Rime data for this PoC:
+## 为什么做 pinyin
 
-```sh
-bash scripts/download-rime-data.sh
-export RIME_SHARED_DATA_DIR="$PWD/data/shared"
-export RIME_USER_DATA_DIR="$PWD/data/user"
-export RIME_SCHEMA=luna_pinyin_simp
-```
+在代码、终端和中文消息之间来回工作时，输入法状态本身常常成为一种干扰：回复消息要中文，写代码要英文；一旦忘记切回，tmux 等终端工具的快捷键就可能失效。Shift 切换、输入法自带的中英文模式，以及按应用自动切换工具虽然能缓解问题，但仍需要持续留意“现在到底是什么状态”。
 
-The CLI/listener strips the configured prefix/suffix. In the default
-`segmented` mode, it splits the body into pinyin runs and separators, sends each
-pinyin run to Rime independently, then rejoins the converted text. Half-width
-separators are converted where there is a Chinese punctuation equivalent:
+与此同时，越来越多的长段中文可以通过语音完成，真正需要键盘手动输入中文的场景反而变得零散。既然中文输入只是偶发需求，那么为它多键入一个明确的前缀是可以接受的；换来的好处是，绝大多数时间都能安心停留在英文输入源中。
 
-```text
-,  -> ，
-.  -> 。
-?  -> ？
-!  -> ！
--  -> －
-+  -> ＋
-... -> ……
-~  -> ～
-"  -> “ / ”
-```
+espanso 的触发展开方式启发了这个思路：让一个短前缀开启一段具有特殊语义的输入。pinyin 把这种交互从“展开一个 snippet”延伸成“临时进入一次完整的中文拼音会话”。这就是它与传统输入法切换方案最重要的不同。
 
-For an experimental mixed Chinese/English trial, switch to `rime-auto`. This
-feeds the whole body to one Rime session and lets the active schema decide when
-to commit text and how to handle English-looking input:
+## 致谢
 
-```sh
-cargo run -- --conversion-mode rime-auto ';;wo ai OpenAI,yong Rust kaifa;;'
-```
-
-The same mode can be set in `rime-poc.toml`:
-
-```toml
-conversion_mode = "rime-auto"
-```
-
-`rime-auto` is intentionally experimental. It is useful for measuring Rime's
-native mixed-input behavior, while `segmented` remains the safer default for
-predictable auto-replacement.
-
-The CLI prints the body, final output, tokenization, and each Rime segment's
-preedit/first candidate. It exits with an error if `librime`, schema data, or
-the trigger config are invalid.
+- 感谢 [espanso](https://espanso.org/) 带来的前缀触发与文本展开灵感。
+- 感谢 [Rime](https://rime.im/) 及其开放生态提供可靠、可组合的中文输入引擎与数据基础。

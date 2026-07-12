@@ -133,10 +133,13 @@ While the session is active, Space or any non-pinyin separator that is not part
 of the configured trigger converts the preceding pinyin immediately, so you do
 not have to wait for the closing trigger. Space acts like a commit key and is
 not reinserted; punctuation separators are kept and mapped where a mapping
-exists. The candidate panel remains the active-state indicator after committed
-output. The closing trigger only removes pending raw text and the suffix; it
-does not rewrite earlier converted text. Pressing Backspace immediately after
-an incremental conversion restores the original pinyin text for editing.
+exists. A physical Space used as this commit key is consumed before it reaches
+the host; a following Space is therefore an ordinary first host Space and does
+not trigger macOS's double-space period substitution. The candidate panel
+remains the active-state indicator after committed output. The closing trigger
+only removes pending raw text and the suffix; it does not rewrite earlier
+converted text. Pressing Backspace immediately after an incremental conversion
+restores the original pinyin text for editing.
 The listener separately tracks pending raw text, committed output that still
 belongs to the active session, and the hidden opening prefix. Deleting all
 visible session output therefore keeps the session active until one additional
@@ -163,6 +166,10 @@ pending pinyin buffer. While that pending pinyin produces a candidate menu, a
 configured selection key chooses its corresponding available candidate and the
 configured page keys (`=` / `-` by default) move to the next / previous page. A
 selection key is not consumed when its page has no corresponding candidate.
+If the chosen candidate consumes only a prefix of the pinyin, the listener
+commits that selected text, keeps the unconsumed raw pinyin visible, resets to
+candidate page zero, and immediately rebuilds candidates for the remainder.
+Selection can repeat until the pending pinyin is completely consumed.
 Candidate selection and paging keys type normally when there is no pending
 candidate menu and never enter an empty pinyin buffer. If pending letters have
 no Rime menu (for example invalid pinyin), both those letters and the control

@@ -119,6 +119,17 @@ struct CandidatePreview {
     is_last_page: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CandidateSelection {
+    Complete {
+        text: String,
+    },
+    Partial {
+        selected_text: String,
+        remaining_pinyin: String,
+    },
+}
+
 #[derive(Debug)]
 struct ConversionOutput {
     body: String,
@@ -158,6 +169,15 @@ struct InsertLiteralAction {
 #[derive(Debug, PartialEq, Eq)]
 struct PendingCommitAction {
     original_text: String,
+    replacement_text: String,
+    delete_chars: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PendingCandidateAction {
+    original_text: String,
+    selected_text: String,
+    remaining_pinyin: Option<String>,
     replacement_text: String,
     delete_chars: usize,
 }
@@ -1554,6 +1574,70 @@ impl CaptureState {
         })
     }
 
+    fn take_candidate_selection(
+        &mut self,
+        selection: CandidateSelection,
+    ) -> Option<PendingCandidateAction> {
+        let original_text = self.pending_pinyin()?;
+        let delete_chars = self.current_segment_delete_chars();
+
+        let (selected_text, remaining_pinyin, replacement_text) = match selection {
+            CandidateSelection::Complete { text } => {
+                if text.is_empty() {
+                    return None;
+                }
+                (text.clone(), None, text)
+            }
+            CandidateSelection::Partial {
+                selected_text,
+                remaining_pinyin,
+            } => {
+                let original_chars = original_text.chars().count();
+                let remaining_chars = remaining_pinyin.chars().count();
+                if selected_text.is_empty()
+                    || remaining_pinyin.is_empty()
+                    || remaining_chars >= original_chars
+                    || !original_text.ends_with(&remaining_pinyin)
+                    || !remaining_pinyin.chars().all(is_pinyin_char)
+                    || !remaining_pinyin.chars().any(|ch| ch.is_ascii_alphabetic())
+                {
+                    return None;
+                }
+
+                let replacement_text = format!("{selected_text}{remaining_pinyin}");
+                (selected_text, Some(remaining_pinyin), replacement_text)
+            }
+        };
+
+        match &remaining_pinyin {
+            Some(remaining) => {
+                self.buffer.clone_from(remaining);
+                self.buffer_visible = vec![true; remaining.chars().count()];
+            }
+            None => {
+                self.buffer.clear();
+                self.buffer_visible.clear();
+            }
+        }
+        self.candidate_page = 0;
+        self.last_conversion = None;
+
+        Some(PendingCandidateAction {
+            original_text,
+            selected_text,
+            remaining_pinyin,
+            replacement_text,
+            delete_chars,
+        })
+    }
+
+    fn record_partial_candidate(&mut self, selected_text: &str) {
+        self.committed_output_chars = self
+            .committed_output_chars
+            .saturating_add(selected_text.chars().count());
+        self.last_conversion = None;
+    }
+
     fn set_candidate_page(&mut self, page_no: usize) {
         self.candidate_page = page_no;
     }
@@ -1710,7 +1794,10 @@ impl ListenerRuntime {
         }
 
         let was_active = self.capture.is_active();
-        let visible = !event.is_buffered_replay();
+        let consume_commit_space =
+            is_pending_pinyin_commit_space(&self.capture, event.key_code, &text);
+        let visible = !event.is_buffered_replay() && !consume_commit_space;
+        let recovery_visible = visible || consume_commit_space;
         let will_rewrite = self.capture.will_rewrite_after_text(&text, visible);
         let rewrite_recovery = will_rewrite.then(|| {
             (
@@ -1721,13 +1808,14 @@ impl ListenerRuntime {
         });
         let mut rewrite_transaction = will_rewrite.then(RewriteTransactionGuard::begin);
         let action = self.capture.push_text_with_visibility(&text, visible);
+        let handled_action = action.is_some();
         self.record_session_input_source_if_opened(was_active, &input_source);
 
         if let Some(action) = action {
             if let Err(error) = self.handle_action(action) {
                 if let Some((capture, quote_state, session_input_source)) = rewrite_recovery {
                     self.capture
-                        .restore_after_failed_rewrite(capture, &text, visible);
+                        .restore_after_failed_rewrite(capture, &text, recovery_visible);
                     self.quote_state = quote_state;
                     self.session_input_source = session_input_source;
                     let delete_chars = self.capture.visible_buffer_chars();
@@ -1763,7 +1851,7 @@ impl ListenerRuntime {
             );
         }
 
-        Ok(false)
+        Ok(consume_commit_space && handled_action)
     }
 
     fn skip_if_input_source_is_not_system(&mut self, input_source: &str) -> bool {
@@ -1962,7 +2050,7 @@ impl ListenerRuntime {
                 }
             };
             let kind = format!("candidate page={} index={index}", current.page_no);
-            return match self.commit_pending_text(selected, &kind) {
+            return match self.commit_candidate_selection(selected, &kind) {
                 Ok(()) => Ok(Some(true)),
                 Err(error) => {
                     eprintln!(
@@ -2010,6 +2098,44 @@ impl ListenerRuntime {
             eprintln!("listener candidate page preview error: {error:#}");
         }
         Ok(Some(true))
+    }
+
+    fn commit_candidate_selection(
+        &mut self,
+        selection: CandidateSelection,
+        kind: &str,
+    ) -> Result<()> {
+        let previous = self.capture.clone();
+        let action = self
+            .capture
+            .take_candidate_selection(selection)
+            .context("candidate selection no longer matches the pending pinyin")?;
+        let quote_state_before = self.quote_state;
+
+        if let Err(error) = self.perform_rewrite(action.delete_chars, &action.replacement_text) {
+            self.capture = previous;
+            return Err(error);
+        }
+
+        println!(
+            "[listener] {kind} commit delete_chars={} raw={:?} selected={:?} remaining={:?} output={:?}",
+            action.delete_chars,
+            action.original_text,
+            action.selected_text,
+            action.remaining_pinyin,
+            action.replacement_text
+        );
+        if action.remaining_pinyin.is_some() {
+            self.capture.record_partial_candidate(&action.selected_text);
+        } else {
+            self.capture.record_conversion(
+                action.original_text,
+                action.replacement_text,
+                quote_state_before,
+            );
+        }
+        self.refresh_candidate_panel_best_effort(kind);
+        Ok(())
     }
 
     fn commit_pending_text(&mut self, replacement_text: String, kind: &str) -> Result<()> {
@@ -2248,6 +2374,11 @@ fn event_input_source_fingerprint(event: &mac::InputEvent) -> String {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn is_pending_pinyin_commit_space(capture: &CaptureState, key_code: u32, text: &str) -> bool {
+    key_code == mac::KEY_SPACE && text == " " && capture.pending_pinyin().is_some()
+}
+
 fn input_source_is_system(input_source: &str) -> bool {
     input_source
         .split('|')
@@ -2343,33 +2474,92 @@ fn select_candidate(
     body: &str,
     page_no: usize,
     index: usize,
-) -> Result<Option<String>> {
-    let Some((mut session, _)) = open_candidate_session(options, body, page_no)? else {
+) -> Result<Option<CandidateSelection>> {
+    let Some((mut session, raw)) = open_candidate_session(options, body, page_no)? else {
         return Ok(None);
     };
 
-    let selected_text = session.context().and_then(|context| {
-        context
-            .menu()
-            .candidates
-            .get(index)
-            .map(|candidate| candidate.text.to_owned())
-    });
-    let Some(selected_text) = selected_text else {
-        session.close().context("failed to close Rime session")?;
-        return Ok(None);
-    };
+    let outcome = (|| -> Result<Option<CandidateSelection>> {
+        let selected_text = session.context().and_then(|context| {
+            context
+                .menu()
+                .candidates
+                .get(index)
+                .map(|candidate| candidate.text.to_owned())
+        });
+        let Some(selected_text) = selected_text else {
+            return Ok(None);
+        };
 
-    if !rime_direct::select_candidate_on_current_page(session.session_id, index)? {
-        session.close().context("failed to close Rime session")?;
-        return Ok(None);
+        if !rime_direct::select_candidate_on_current_page(session.session_id, index)? {
+            return Ok(None);
+        }
+
+        if let Some(commit) = session.commit() {
+            return Ok(Some(CandidateSelection::Complete {
+                text: commit.text().to_owned(),
+            }));
+        }
+
+        let context = session
+            .context()
+            .context("Rime returned neither a commit nor a post-selection context")?;
+        let composition = context.composition();
+        let preedit = composition
+            .preedit
+            .context("Rime partial selection has no preedit")?;
+        let remaining_preedit = preedit.get(composition.sel_start..).with_context(|| {
+            format!(
+                "Rime partial selection boundary {} is invalid for preedit {preedit:?}",
+                composition.sel_start
+            )
+        })?;
+        let remaining_pinyin = remaining_raw_pinyin(&raw, remaining_preedit).with_context(|| {
+            format!(
+                "Rime partial selection made no valid progress: raw={raw:?} preedit={preedit:?} boundary={}",
+                composition.sel_start
+            )
+        })?;
+        if context.menu().candidates.is_empty() {
+            bail!("Rime partial selection left no candidates for {remaining_pinyin:?}")
+        }
+
+        Ok(Some(CandidateSelection::Partial {
+            selected_text,
+            remaining_pinyin,
+        }))
+    })();
+
+    let close_result = session.close().context("failed to close Rime session");
+    let outcome = outcome?;
+    close_result?;
+    Ok(outcome)
+}
+
+fn remaining_raw_pinyin(original: &str, remaining_preedit: &str) -> Option<String> {
+    let remaining_letters = remaining_preedit
+        .chars()
+        .filter(|ch| ch.is_ascii_alphabetic())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect::<String>();
+    let original_letters = original
+        .chars()
+        .filter(|ch| ch.is_ascii_alphabetic())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect::<String>();
+    if remaining_letters.is_empty() || remaining_letters == original_letters {
+        return None;
     }
-    let committed_text = session
-        .commit()
-        .map(|commit| commit.text().to_owned())
-        .unwrap_or(selected_text);
-    session.close().context("failed to close Rime session")?;
-    Ok(Some(committed_text))
+
+    original.char_indices().find_map(|(index, _)| {
+        let suffix = original[index..].trim_start_matches('\'');
+        let suffix_letters = suffix
+            .chars()
+            .filter(|ch| ch.is_ascii_alphabetic())
+            .map(|ch| ch.to_ascii_lowercase())
+            .collect::<String>();
+        (suffix_letters == remaining_letters && !suffix.is_empty()).then(|| suffix.to_owned())
+    })
 }
 
 fn pending_pinyin_for_preview(body: &str) -> String {
@@ -2782,9 +2972,10 @@ mod tests {
     fn space_triggers_incremental_conversion_without_restoring_space() {
         let mut capture = test_capture_state();
         capture.push_text(";;");
+        capture.push_text("woyaoceshi");
 
-        assert!(capture.will_rewrite_after_text("woyaoceshi ", true));
-        let action = capture.push_text("woyaoceshi ");
+        assert!(capture.will_rewrite_after_text(" ", false));
+        let action = capture.push_text_with_visibility(" ", false);
 
         assert_eq!(
             action,
@@ -2792,7 +2983,7 @@ mod tests {
                 typed_text: "woyaoceshi ".to_owned(),
                 body: "woyaoceshi".to_owned(),
                 restore_text: "woyaoceshi".to_owned(),
-                delete_chars: "woyaoceshi ".chars().count(),
+                delete_chars: "woyaoceshi".chars().count(),
                 stay_active: true,
             }))
         );
@@ -2943,6 +3134,130 @@ mod tests {
         assert!(capture.buffer.is_empty());
         assert_eq!(capture.candidate_page, 0);
         assert!(capture.is_active());
+    }
+
+    #[test]
+    fn partial_candidate_selection_preserves_remaining_pinyin() {
+        let mut capture = test_capture_state();
+        capture.push_text(";;woshizhongguoren");
+        capture.set_candidate_page(2);
+
+        let action = capture
+            .take_candidate_selection(CandidateSelection::Partial {
+                selected_text: "我是".to_owned(),
+                remaining_pinyin: "zhongguoren".to_owned(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            action,
+            PendingCandidateAction {
+                original_text: "woshizhongguoren".to_owned(),
+                selected_text: "我是".to_owned(),
+                remaining_pinyin: Some("zhongguoren".to_owned()),
+                replacement_text: "我是zhongguoren".to_owned(),
+                delete_chars: "woshizhongguoren".chars().count(),
+            }
+        );
+        assert_eq!(capture.buffer, "zhongguoren");
+        assert_eq!(capture.buffer_visible, vec![true; "zhongguoren".len()]);
+        assert_eq!(capture.candidate_page, 0);
+        assert!(capture.is_active());
+        assert_eq!(capture.committed_output_chars, 0);
+
+        capture.record_partial_candidate(&action.selected_text);
+        assert_eq!(capture.committed_output_chars, 2);
+        assert_eq!(capture.last_conversion, None);
+
+        capture.backspace();
+        assert_eq!(capture.buffer, "zhongguore");
+        assert_eq!(capture.committed_output_chars, 2);
+    }
+
+    #[test]
+    fn repeated_partial_candidate_selection_finishes_the_remaining_pinyin() {
+        let mut capture = test_capture_state();
+        capture.push_text(";;woshizhongguoren");
+
+        let first = capture
+            .take_candidate_selection(CandidateSelection::Partial {
+                selected_text: "我是".to_owned(),
+                remaining_pinyin: "zhongguoren".to_owned(),
+            })
+            .unwrap();
+        capture.record_partial_candidate(&first.selected_text);
+
+        let second = capture
+            .take_candidate_selection(CandidateSelection::Partial {
+                selected_text: "中国".to_owned(),
+                remaining_pinyin: "ren".to_owned(),
+            })
+            .unwrap();
+        assert_eq!(second.original_text, "zhongguoren");
+        assert_eq!(second.replacement_text, "中国ren");
+        assert_eq!(second.delete_chars, "zhongguoren".chars().count());
+        capture.record_partial_candidate(&second.selected_text);
+
+        let final_action = capture
+            .take_candidate_selection(CandidateSelection::Complete {
+                text: "人".to_owned(),
+            })
+            .unwrap();
+        assert_eq!(final_action.original_text, "ren");
+        assert_eq!(final_action.replacement_text, "人");
+        assert_eq!(final_action.remaining_pinyin, None);
+        assert!(capture.buffer.is_empty());
+        capture.record_conversion(
+            final_action.original_text,
+            final_action.replacement_text,
+            QuoteState::default(),
+        );
+
+        assert_eq!(capture.committed_output_chars, 5);
+        assert!(capture.is_active());
+    }
+
+    #[test]
+    fn candidate_selection_suffix_preserves_internal_apostrophe() {
+        assert_eq!(
+            remaining_raw_pinyin("woshizhongguoren", "zhong guo ren"),
+            Some("zhongguoren".to_owned())
+        );
+        assert_eq!(
+            remaining_raw_pinyin("woxi'anren", "xi an ren"),
+            Some("xi'anren".to_owned())
+        );
+        assert_eq!(remaining_raw_pinyin("ni", "ni"), None);
+        assert_eq!(remaining_raw_pinyin("ni", ""), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn space_commit_is_invisible_and_deletes_only_pending_pinyin() {
+        let mut capture = test_capture_state();
+        capture.push_text(";;ni");
+
+        assert!(is_pending_pinyin_commit_space(
+            &capture,
+            mac::KEY_SPACE,
+            " "
+        ));
+        let action = capture.push_text_with_visibility(" ", false);
+
+        assert!(matches!(
+            action,
+            Some(CaptureAction::Convert(ConversionAction {
+                typed_text,
+                body,
+                delete_chars: 2,
+                stay_active: true,
+                ..
+            })) if typed_text == "ni " && body == "ni"
+        ));
+
+        let mut empty = test_capture_state();
+        empty.push_text(";;");
+        assert!(!is_pending_pinyin_commit_space(&empty, mac::KEY_SPACE, " "));
     }
 
     #[test]
@@ -3696,8 +4011,49 @@ english_commit_key = "\\"
 
             let selected = select_candidate(&options, "shi", 1, 1)?;
             anyhow::ensure!(
-                selected.as_deref() == Some(expected_selected.as_str()),
+                matches!(
+                    selected,
+                    Some(CandidateSelection::Complete { ref text })
+                        if text == &expected_selected
+                ),
                 "candidate selection did not commit the displayed page candidate: expected={expected_selected:?} actual={selected:?}"
+            );
+
+            let multi_syllable = "woshizhongguoren";
+            let multi_preview = preview_candidates(&options, multi_syllable, 10, 0)?;
+            let partial_index = multi_preview
+                .candidates
+                .iter()
+                .position(|candidate| candidate == "我是")
+                .context("multi-syllable first page has no partial candidate 我是")?;
+            let partial = select_candidate(&options, multi_syllable, 0, partial_index)?;
+            let remaining = match partial {
+                Some(CandidateSelection::Partial {
+                    selected_text,
+                    remaining_pinyin,
+                }) => {
+                    anyhow::ensure!(selected_text == "我是", "unexpected partial selection");
+                    anyhow::ensure!(
+                        remaining_pinyin == "zhongguoren",
+                        "unexpected partial remainder: {remaining_pinyin:?}"
+                    );
+                    remaining_pinyin
+                }
+                other => bail!("expected partial candidate selection, got {other:?}"),
+            };
+
+            let remaining_preview = preview_candidates(&options, &remaining, 5, 0)?;
+            anyhow::ensure!(
+                !remaining_preview.candidates.is_empty(),
+                "remaining pinyin produced no candidates"
+            );
+            let final_selection = select_candidate(&options, &remaining, 0, 0)?;
+            anyhow::ensure!(
+                matches!(
+                    final_selection,
+                    Some(CandidateSelection::Complete { ref text }) if !text.is_empty()
+                ),
+                "remaining pinyin did not finish with a complete selection: {final_selection:?}"
             );
             Ok(())
         })();

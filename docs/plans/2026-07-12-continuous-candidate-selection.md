@@ -129,7 +129,8 @@ Add a deterministic partial-selection scenario and assert host text plus the
 next candidate log after each selection. With
 `NSAutomaticPeriodSubstitutionEnabled=1`, type `ni<Space><Space>` and assert the
 converted text ends in exactly one ordinary space and contains no English
-period. Restore any preference changed by the test harness.
+period. Record the current preference for evidence but do not mutate the user's
+global setting.
 
 **Step 3: Run full verification**
 

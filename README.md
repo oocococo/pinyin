@@ -43,7 +43,7 @@ pinyin 尤其适合这些使用习惯：
 
 普通用户推荐使用便携包，不需要在目标 Mac 上安装 Rust、Homebrew 或 librime。
 
-1. 打开 [GitHub Releases](https://github.com/oocococo/pinyin/releases)，下载最新的 macOS portable 压缩包。
+1. 打开 [GitHub Releases](https://github.com/oocococo/pinyin/releases)，按 Mac 芯片下载对应压缩包：Apple Silicon 使用 `macos-arm64`，Intel Mac 使用 `macos-x86_64`。
 2. 解压后，在终端进入该目录并启动监听器：
 
    ```sh
@@ -89,7 +89,7 @@ pinyin 尤其适合这些使用习惯：
 
 ## 配置
 
-编辑便携包或仓库根目录中的 TOML 配置文件，然后重新启动监听器：
+编辑便携包或仓库根目录中的 `pinyin.toml`，然后重新启动监听器：
 
 ```toml
 trigger_prefix = "''"
@@ -172,7 +172,7 @@ bash scripts/package-portable-macos.sh
 
 ## 参与贡献
 
-欢迎提交 [Issue](https://github.com/oocococo/pinyin/issues) 或 Pull Request。无论是输入体验、候选交互、Rime 方案兼容、macOS 应用适配、安装分发，还是文档改进，都很有价值。
+欢迎提交 [Issue](https://github.com/oocococo/pinyin/issues) 或 Pull Request。无论是输入体验、候选交互、Rime 方案兼容、macOS 应用适配、安装分发，还是文档改进，都很有价值。完整开发流程请参阅 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 报告问题时，建议附上：
 
@@ -182,6 +182,10 @@ bash scripts/package-portable-macos.sh
 - `./run-listener-debug.sh` 生成的相关日志。
 
 日志可能包含按键与输入内容，请在公开提交前先检查并删除敏感信息。
+
+## 许可证
+
+pinyin 采用 [MIT License](LICENSE)。便携包中包含的 Rime 数据、librime 及其他运行时依赖继续适用各自许可证，详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 ## 为什么做 pinyin
 

@@ -18,8 +18,8 @@ mod rime_direct;
 #[cfg(target_os = "macos")]
 mod mac;
 
-const DEFAULT_CONFIG_FILE: &str = "rime-poc.toml";
-const DEFAULT_TRIGGER: &str = ";;";
+const DEFAULT_CONFIG_FILE: &str = "pinyin.toml";
+const DEFAULT_TRIGGER: &str = "''";
 const DEFAULT_MAX_BUFFER_CHARS: usize = 4096;
 const DEFAULT_INJECT_DELAY_MS: i32 = 1;
 const DEFAULT_CANDIDATE_COUNT: usize = 5;
@@ -320,10 +320,10 @@ fn main() -> Result<()> {
     traits
         .set_shared_data_dir(path_to_str(&options.shared_data_dir)?)
         .set_user_data_dir(path_to_str(&options.user_data_dir)?)
-        .set_distribution_name("rime-poc")
-        .set_distribution_code_name("rime-poc")
+        .set_distribution_name("pinyin")
+        .set_distribution_code_name("pinyin")
         .set_distribution_version(env!("CARGO_PKG_VERSION"))
-        .set_app_name("rime-poc")
+        .set_app_name("pinyin")
         .set_min_log_level(2);
 
     setup(&mut traits);
@@ -351,31 +351,31 @@ impl Options {
             .map(PathBuf::from)
             .unwrap_or_else(default_user_data_dir);
         let mut schema = env::var("RIME_SCHEMA").unwrap_or_else(|_| "luna_pinyin_simp".to_owned());
-        let mut config_path = env::var_os("RIME_POC_CONFIG").map(PathBuf::from);
+        let mut config_path = env::var_os("PINYIN_CONFIG").map(PathBuf::from);
         let mut body_mode = false;
         let mut doctor = false;
         let mut listen = false;
-        let mut log_events = env_flag("RIME_POC_LOG_EVENTS");
-        let mut conversion_mode_override = env::var("RIME_POC_CONVERSION_MODE")
+        let mut log_events = env_flag("PINYIN_LOG_EVENTS");
+        let mut conversion_mode_override = env::var("PINYIN_CONVERSION_MODE")
             .ok()
             .map(|value| ConversionMode::parse(&value))
             .transpose()?;
-        let mut candidate_layout_override = env::var("RIME_POC_CANDIDATE_LAYOUT")
+        let mut candidate_layout_override = env::var("PINYIN_CANDIDATE_LAYOUT")
             .ok()
             .map(|value| CandidateLayout::parse(&value))
             .transpose()?;
-        let mut candidate_count_override = env::var("RIME_POC_CANDIDATE_COUNT")
+        let mut candidate_count_override = env::var("PINYIN_CANDIDATE_COUNT")
             .ok()
-            .map(|value| parse_usize(&value, "RIME_POC_CANDIDATE_COUNT"))
+            .map(|value| parse_usize(&value, "PINYIN_CANDIDATE_COUNT"))
             .transpose()?;
-        let mut max_buffer_chars = env::var("RIME_POC_MAX_BUFFER_CHARS")
+        let mut max_buffer_chars = env::var("PINYIN_MAX_BUFFER_CHARS")
             .ok()
-            .map(|value| parse_usize(&value, "RIME_POC_MAX_BUFFER_CHARS"))
+            .map(|value| parse_usize(&value, "PINYIN_MAX_BUFFER_CHARS"))
             .transpose()?
             .unwrap_or(DEFAULT_MAX_BUFFER_CHARS);
-        let mut inject_delay_ms = env::var("RIME_POC_INJECT_DELAY_MS")
+        let mut inject_delay_ms = env::var("PINYIN_INJECT_DELAY_MS")
             .ok()
-            .map(|value| parse_i32(&value, "RIME_POC_INJECT_DELAY_MS"))
+            .map(|value| parse_i32(&value, "PINYIN_INJECT_DELAY_MS"))
             .transpose()?
             .unwrap_or(DEFAULT_INJECT_DELAY_MS);
         let mut input_parts = Vec::new();
@@ -897,7 +897,7 @@ fn run_listener(options: Options) -> Result<()> {
         .ok_or_else(|| anyhow!("listener runtime was not initialized"))?
         .lock()
         .map_err(|_| anyhow!("listener runtime lock is poisoned"))?;
-    println!("rime-poc listener started");
+    println!("pinyin listener started");
     println!("pid:             {}", process::id());
     println!("accessibility:   {}", mac::is_accessibility_trusted(false));
     println!("input_monitoring: {}", mac::has_input_monitoring_access());
@@ -949,9 +949,11 @@ fn ensure_accessibility_interactive() -> Result<()> {
     }
 
     eprintln!();
-    eprintln!("rime-poc needs macOS Accessibility permission before it can listen to keys and inject text.");
+    eprintln!(
+        "pinyin needs macOS Accessibility permission before it can listen to keys and inject text."
+    );
     eprintln!("I will open System Settings > Privacy & Security > Accessibility.");
-    eprintln!("Enable the current terminal app or the rime-poc binary, then return here.");
+    eprintln!("Enable the current terminal app or the pinyin binary, then return here.");
     eprintln!();
 
     let _ = mac::is_accessibility_trusted(true);
@@ -992,10 +994,10 @@ fn ensure_input_monitoring_interactive() -> Result<()> {
 
     eprintln!();
     eprintln!(
-        "rime-poc needs macOS Input Monitoring permission before it can receive global key events."
+        "pinyin needs macOS Input Monitoring permission before it can receive global key events."
     );
     eprintln!("I will request Input Monitoring access and open System Settings.");
-    eprintln!("Enable the rime-poc binary, then return here.");
+    eprintln!("Enable the pinyin binary, then return here.");
     eprintln!();
 
     let _ = mac::request_input_monitoring_access();
@@ -1025,14 +1027,14 @@ fn ensure_input_monitoring_interactive() -> Result<()> {
         }
 
         eprintln!("Input Monitoring permission is still not active.");
-        eprintln!("If you just enabled it, macOS may require quitting and rerunning rime-poc.");
+        eprintln!("If you just enabled it, macOS may require quitting and rerunning pinyin.");
         open_input_monitoring_settings();
     }
 }
 
 #[cfg(target_os = "macos")]
 fn open_accessibility_settings() {
-    if env::var_os("RIME_POC_SKIP_OPEN_SETTINGS").is_some() {
+    if env::var_os("PINYIN_SKIP_OPEN_SETTINGS").is_some() {
         return;
     }
 
@@ -1044,7 +1046,7 @@ fn open_accessibility_settings() {
 
 #[cfg(target_os = "macos")]
 fn open_input_monitoring_settings() {
-    if env::var_os("RIME_POC_SKIP_OPEN_SETTINGS").is_some() {
+    if env::var_os("PINYIN_SKIP_OPEN_SETTINGS").is_some() {
         return;
     }
 
@@ -2765,7 +2767,7 @@ fn map_separator(value: &str, quote_state: &mut QuoteState) -> String {
 }
 
 fn print_doctor(options: &Options) {
-    println!("rime-poc doctor");
+    println!("pinyin doctor");
     println!("shared_data_dir: {}", options.shared_data_dir.display());
     println!("  exists: {}", options.shared_data_dir.exists());
     println!("user_data_dir:   {}", options.user_data_dir.display());
@@ -2856,17 +2858,17 @@ fn next_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<Strin
 
 fn print_help() {
     println!(
-        "Usage: rime-poc [OPTIONS] <triggered-text>\n\n\
+        "Usage: pinyin [OPTIONS] <triggered-text>\n\n\
 Options:\n  \
---config <FILE>          Trigger config file [env: RIME_POC_CONFIG] [default: ./rime-poc.toml if present]\n  \
---conversion-mode <MODE> Conversion mode: segmented or rime-auto [env: RIME_POC_CONVERSION_MODE]\n  \
---candidate-layout <LAYOUT> Candidate layout: horizontal or vertical [env: RIME_POC_CANDIDATE_LAYOUT] [default: horizontal]\n  \
---candidate-count <N>    Candidate count shown in the UI, 1-10 [env: RIME_POC_CANDIDATE_COUNT] [default: 5]\n  \
+--config <FILE>          Trigger config file [env: PINYIN_CONFIG] [default: ./pinyin.toml if present]\n  \
+--conversion-mode <MODE> Conversion mode: segmented or rime-auto [env: PINYIN_CONVERSION_MODE]\n  \
+--candidate-layout <LAYOUT> Candidate layout: horizontal or vertical [env: PINYIN_CANDIDATE_LAYOUT] [default: horizontal]\n  \
+--candidate-count <N>    Candidate count shown in the UI, 1-10 [env: PINYIN_CANDIDATE_COUNT] [default: 5]\n  \
 --listen                 Start macOS global listener mode\n  \
---log-events             Print every key/mouse event seen by the listener [env: RIME_POC_LOG_EVENTS]\n  \
+--log-events             Print every key/mouse event seen by the listener [env: PINYIN_LOG_EVENTS]\n  \
 --body                   Treat input as body text without requiring trigger prefix/suffix\n  \
---max-buffer-chars <N>   Maximum listener buffer length [env: RIME_POC_MAX_BUFFER_CHARS] [default: 4096]\n  \
---inject-delay-ms <N>    Delay between injected key events [env: RIME_POC_INJECT_DELAY_MS] [default: 1]\n  \
+--max-buffer-chars <N>   Maximum listener buffer length [env: PINYIN_MAX_BUFFER_CHARS] [default: 4096]\n  \
+--inject-delay-ms <N>    Delay between injected key events [env: PINYIN_INJECT_DELAY_MS] [default: 1]\n  \
 --shared-data-dir <DIR>  Rime shared data directory [env: RIME_SHARED_DATA_DIR]\n  \
 --user-data-dir <DIR>    Rime user data directory [env: RIME_USER_DATA_DIR]\n  \
 --schema <ID>            Rime schema id [env: RIME_SCHEMA] [default: luna_pinyin_simp]\n  \
@@ -2887,7 +2889,15 @@ mod tests {
     }
 
     fn test_capture_state() -> CaptureState {
-        CaptureState::new(AppConfig::default(), 128)
+        CaptureState::new(test_capture_config(), 128)
+    }
+
+    fn test_capture_config() -> AppConfig {
+        AppConfig {
+            trigger_prefix: ";;".to_owned(),
+            trigger_suffix: ";;".to_owned(),
+            ..AppConfig::default()
+        }
     }
 
     #[test]
@@ -3929,7 +3939,7 @@ mod tests {
 
         let config = AppConfig {
             english_commit_key: ";".to_owned(),
-            ..AppConfig::default()
+            ..test_capture_config()
         };
         assert!(validate_config(&config)
             .unwrap_err()
@@ -3944,7 +3954,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let path = env::temp_dir().join(format!(
-            "rime-poc-custom-interaction-{}-{unique}.toml",
+            "pinyin-custom-interaction-{}-{unique}.toml",
             std::process::id()
         ));
         fs::write(
@@ -3994,7 +4004,7 @@ english_commit_key = "\\"
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let shared_data_dir = manifest_dir.join("data/shared");
         let user_data_dir =
-            env::temp_dir().join(format!("rime-poc-candidate-test-{}", std::process::id()));
+            env::temp_dir().join(format!("pinyin-candidate-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&user_data_dir);
         fs::create_dir_all(&user_data_dir).unwrap();
         fs::copy(
@@ -4007,10 +4017,10 @@ english_commit_key = "\\"
         traits
             .set_shared_data_dir(path_to_str(&shared_data_dir).unwrap())
             .set_user_data_dir(path_to_str(&user_data_dir).unwrap())
-            .set_distribution_name("rime-poc-test")
-            .set_distribution_code_name("rime-poc-test")
+            .set_distribution_name("pinyin-test")
+            .set_distribution_code_name("pinyin-test")
             .set_distribution_version(env!("CARGO_PKG_VERSION"))
-            .set_app_name("rime-poc-test")
+            .set_app_name("pinyin-test")
             .set_min_log_level(2);
         setup(&mut traits);
         initialize(&mut traits);

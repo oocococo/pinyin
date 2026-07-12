@@ -78,7 +78,7 @@ enum {
 };
 
 static bool native_event_logging_enabled() {
-  const char *value = getenv("RIME_POC_NATIVE_LOG_EVENTS");
+  const char *value = getenv("PINYIN_NATIVE_LOG_EVENTS");
   if (value == nullptr) {
     return false;
   }
@@ -253,7 +253,7 @@ static void dispatch_context_event(const char *reason) {
 
   if (PAL_LOG_EVENTS) {
     fprintf(stderr,
-            "[rime-poc native] context event reason=%s source=%s\n",
+            "[pinyin native] context event reason=%s source=%s\n",
             reason,
             input.source_buffer_len > 0 ? input.source_buffer : "<unknown>");
     fflush(stderr);
@@ -455,7 +455,7 @@ static bool pal_maybe_buffer_rewrite_event(PalInputEvent input) {
   pal_remember_swallowed_keyup(input.key_code);
   if (PAL_LOG_EVENTS) {
     fprintf(stderr,
-            "[rime-poc native] rewrite transaction buffered key=%u chars=%s len=%lu\n",
+            "[pinyin native] rewrite transaction buffered key=%u chars=%s len=%lu\n",
             input.key_code,
             input.buffer_len > 0 ? input.buffer : "<empty>",
             (unsigned long)input.buffer_len);
@@ -471,7 +471,7 @@ static void pal_replay_rewrite_buffered_events(std::vector<PalInputEvent> events
 
   if (PAL_LOG_EVENTS) {
     fprintf(stderr,
-            "[rime-poc native] replaying %lu rewrite transaction buffered events\n",
+            "[pinyin native] replaying %lu rewrite transaction buffered events\n",
             (unsigned long)events.size());
     fflush(stderr);
   }
@@ -490,7 +490,7 @@ static void pal_replay_rewrite_buffered_events(std::vector<PalInputEvent> events
       }
       if (PAL_LOG_EVENTS) {
         fprintf(stderr,
-                "[rime-poc native] paused replay for nested rewrite transaction remaining=%lu\n",
+                "[pinyin native] paused replay for nested rewrite transaction remaining=%lu\n",
                 (unsigned long)remaining_count);
         fflush(stderr);
       }
@@ -564,7 +564,7 @@ static void pal_finish_current_rewrite_operation(uint64_t generation) {
           PAL_REWRITE_BUFFERED_EVENTS.clear();
           if (PAL_LOG_EVENTS) {
             fprintf(stderr,
-                    "[rime-poc native] rewrite operation finish generation=%llu buffered=%lu queued=%lu\n",
+                    "[pinyin native] rewrite operation finish generation=%llu buffered=%lu queued=%lu\n",
                     (unsigned long long)generation,
                     (unsigned long)events.size(),
                     (unsigned long)PAL_REWRITE_OPERATION_QUEUE.size());
@@ -598,7 +598,7 @@ static void pal_start_next_rewrite_operation() {
   uint64_t generation = PAL_REWRITE_TRANSACTION_GENERATION;
   if (PAL_LOG_EVENTS) {
     fprintf(stderr,
-            "[rime-poc native] rewrite operation begin generation=%llu delete=%u replacement_len=%lu queued=%lu\n",
+            "[pinyin native] rewrite operation begin generation=%llu delete=%u replacement_len=%lu queued=%lu\n",
             (unsigned long long)generation,
             operation.delete_count,
             (unsigned long)operation.replacement_text.size(),
@@ -619,7 +619,7 @@ static bool dispatch_cg_event(CGEventType type, CGEventRef event) {
   CGPoint location = CGEventGetLocation(event);
   if (fabs(location.x - PAL_EVENT_MARKER) < 0.001) {
     if (PAL_LOG_EVENTS) {
-      fprintf(stderr, "[rime-poc native] skipped marked/self CGEvent type=%u\n", type);
+      fprintf(stderr, "[pinyin native] skipped marked/self CGEvent type=%u\n", type);
       fflush(stderr);
     }
     return false;
@@ -647,7 +647,7 @@ static bool dispatch_cg_event(CGEventType type, CGEventRef event) {
 
     if (PAL_LOG_EVENTS) {
       fprintf(stderr,
-              "[rime-poc native] cgevent key type=%u status=%d key=%u modifiers=%u chars=%s len=%lu source=%s\n",
+              "[pinyin native] cgevent key type=%u status=%d key=%u modifiers=%u chars=%s len=%lu source=%s\n",
               type,
               input.status,
               input.key_code,
@@ -679,7 +679,7 @@ static bool dispatch_cg_event(CGEventType type, CGEventRef event) {
 
   if (PAL_LOG_EVENTS) {
     fprintf(stderr,
-            "[rime-poc native] cgevent mouse type=%u source=%s\n",
+            "[pinyin native] cgevent mouse type=%u source=%s\n",
             type,
             input.source_buffer_len > 0 ? input.source_buffer : "<unknown>");
     fflush(stderr);
@@ -699,7 +699,7 @@ static CGEventRef event_tap_callback(
   if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
     if (PAL_EVENT_TAP != nullptr) {
       CGEventTapEnable(PAL_EVENT_TAP, true);
-      fprintf(stderr, "[rime-poc native] re-enabled CGEvent tap after disable event type=%u\n", type);
+      fprintf(stderr, "[pinyin native] re-enabled CGEvent tap after disable event type=%u\n", type);
       fflush(stderr);
     }
     return event;
@@ -1236,7 +1236,7 @@ extern "C" void pal_pinyin_begin_rewrite_transaction() {
   if (PAL_REWRITE_TRANSACTION_ACTIVE) {
     if (PAL_LOG_EVENTS) {
       fprintf(stderr,
-              "[rime-poc native] rewrite transaction already active generation=%llu buffered=%lu\n",
+              "[pinyin native] rewrite transaction already active generation=%llu buffered=%lu\n",
               (unsigned long long)PAL_REWRITE_TRANSACTION_GENERATION,
               (unsigned long)PAL_REWRITE_BUFFERED_EVENTS.size());
       fflush(stderr);
@@ -1250,7 +1250,7 @@ extern "C" void pal_pinyin_begin_rewrite_transaction() {
   PAL_REWRITE_SWALLOWED_KEYUPS.clear();
   if (PAL_LOG_EVENTS) {
     fprintf(stderr,
-            "[rime-poc native] rewrite transaction begin generation=%llu\n",
+            "[pinyin native] rewrite transaction begin generation=%llu\n",
             (unsigned long long)PAL_REWRITE_TRANSACTION_GENERATION);
     fflush(stderr);
   }
@@ -1275,7 +1275,7 @@ extern "C" void pal_pinyin_finish_rewrite_transaction_after_delay(int32_t delay_
           PAL_REWRITE_BUFFERED_EVENTS.clear();
           if (PAL_LOG_EVENTS) {
             fprintf(stderr,
-                    "[rime-poc native] rewrite transaction finish generation=%llu buffered=%lu\n",
+                    "[pinyin native] rewrite transaction finish generation=%llu buffered=%lu\n",
                     (unsigned long long)generation,
                     (unsigned long)events.size());
             fflush(stderr);
@@ -1288,7 +1288,7 @@ extern "C" void pal_pinyin_finish_rewrite_transaction_after_delay(int32_t delay_
 extern "C" void pal_pinyin_abort_rewrite_transaction() {
   if (PAL_REWRITE_OPERATION_RUNNING || !PAL_REWRITE_OPERATION_QUEUE.empty()) {
     fprintf(stderr,
-            "[rime-poc native] refused to abort committed rewrite transaction running=%d queued=%lu\n",
+            "[pinyin native] refused to abort committed rewrite transaction running=%d queued=%lu\n",
             PAL_REWRITE_OPERATION_RUNNING ? 1 : 0,
             (unsigned long)PAL_REWRITE_OPERATION_QUEUE.size());
     fflush(stderr);
@@ -1309,7 +1309,7 @@ extern "C" void pal_pinyin_commit_rewrite_transaction(
           PalRewriteOperation{delete_count, replacement, clamped_delay_ms});
       if (PAL_LOG_EVENTS) {
         fprintf(stderr,
-                "[rime-poc native] rewrite operation queued delete=%u replacement_len=%lu queued=%lu active=%d running=%d\n",
+                "[pinyin native] rewrite operation queued delete=%u replacement_len=%lu queued=%lu active=%d running=%d\n",
                 delete_count,
                 (unsigned long)replacement.size(),
                 (unsigned long)PAL_REWRITE_OPERATION_QUEUE.size(),
@@ -1328,7 +1328,7 @@ extern "C" void pal_pinyin_start_event_loop(PalEventCallback callback) {
   @autoreleasepool {
     PAL_LOG_EVENTS = native_event_logging_enabled();
     fprintf(stderr,
-            "[rime-poc native] starting Cocoa event loop pid=%d log_events=%s\n",
+            "[pinyin native] starting Cocoa event loop pid=%d log_events=%s\n",
             getpid(),
             PAL_LOG_EVENTS ? "true" : "false");
     fflush(stderr);
@@ -1382,14 +1382,14 @@ extern "C" void pal_pinyin_start_event_loop(PalEventCallback callback) {
           PAL_EVENT_TAP_SOURCE,
           kCFRunLoopCommonModes);
       CGEventTapEnable(PAL_EVENT_TAP, true);
-      fprintf(stderr, "[rime-poc native] CGEvent tap registered\n");
+      fprintf(stderr, "[pinyin native] CGEvent tap registered\n");
       fflush(stderr);
       CFRunLoopRun();
       return;
     }
 
     fprintf(stderr,
-            "[rime-poc native] failed to register required suppressing CGEvent tap; listener cannot start safely\n");
+            "[pinyin native] failed to register required suppressing CGEvent tap; listener cannot start safely\n");
     fflush(stderr);
     PAL_CALLBACK = nullptr;
   }
@@ -1397,7 +1397,7 @@ extern "C" void pal_pinyin_start_event_loop(PalEventCallback callback) {
 
 extern "C" void pal_pinyin_inject_backspaces(uint32_t count, int32_t delay_ms) {
   fprintf(stderr,
-          "[rime-poc native] injecting backspaces count=%u delay_ms=%d\n",
+          "[pinyin native] injecting backspaces count=%u delay_ms=%d\n",
           count,
           delay_ms);
   fflush(stderr);
@@ -1413,7 +1413,7 @@ extern "C" void pal_pinyin_inject_backspaces(uint32_t count, int32_t delay_ms) {
 
 extern "C" void pal_pinyin_inject_string(const char *string, int32_t delay_ms) {
   char *string_copy = strdup(string);
-  fprintf(stderr, "[rime-poc native] injecting unicode text delay_ms=%d\n", delay_ms);
+  fprintf(stderr, "[pinyin native] injecting unicode text delay_ms=%d\n", delay_ms);
   fflush(stderr);
 
   dispatch_async(dispatch_get_main_queue(), ^{

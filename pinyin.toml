@@ -1,4 +1,4 @@
-# Trigger strings for the first PoC matcher.
+# Strings used to enter and exit a pinyin session.
 #
 # These values must not contain punctuation that the converter treats as body
 # separators: comma, period, question mark, exclamation mark, minus, plus,

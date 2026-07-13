@@ -1,5 +1,12 @@
 # pinyin
 
+<p>
+  <img src="https://img.shields.io/badge/Rust-000000?style=flat-square&logo=rust&logoColor=white" alt="Rust"/>
+  <img src="https://img.shields.io/github/license/oocococo/pinyin?style=flat-square" alt="License"/>
+  <img src="https://img.shields.io/github/v/release/oocococo/pinyin?style=flat-square" alt="Release"/>
+  <a href="https://linux.do"><img src="https://img.shields.io/badge/友链-linux.do-ffb003?style=flat-square&logo=discourse&logoColor=white" alt="linux.do"/></a>
+</p>
+
 **保持英文输入源，只在需要时用前缀唤起中文拼音。**
 
 pinyin 是一款面向 macOS、实验支持 Windows 的前缀式中文输入工具。它不要求你在中文、英文输入法之间反复切换：平时继续使用系统英文输入源，写代码、操作终端和触发快捷键；需要手动输入中文时，键入前缀进入拼音模式，完成后再用同一字符串退出。

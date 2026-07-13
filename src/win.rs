@@ -3,48 +3,143 @@ use std::{
     os::raw::{c_char, c_int, c_uint},
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
-use super::InputEvent;
+use crate::CandidateLayout;
 
 pub const PLATFORM_NAME: &str = "Windows";
 
+pub const EVENT_KEYBOARD: i32 = 1;
+pub const EVENT_MOUSE: i32 = 2;
+pub const EVENT_CONTEXT: i32 = 3;
+pub const STATUS_PRESSED: i32 = 1;
+
+pub const MODIFIER_COMMAND: u32 = 1 << 0;
+pub const MODIFIER_CONTROL: u32 = 1 << 1;
+pub const MODIFIER_OPTION: u32 = 1 << 2;
+pub const MODIFIER_BUFFERED_REPLAY: u32 = 1 << 4;
+pub const MODIFIER_REWRITE_ACTIVE: u32 = 1 << 5;
+
 pub const KEY_BACKSPACE: u32 = 0x08;
 pub const KEY_ENTER: u32 = 0x0D;
+pub const KEY_RETURN: u32 = 0x0E;
 pub const KEY_ESCAPE: u32 = 0x1B;
+pub const KEY_A: u32 = b'A' as u32;
+pub const KEY_C: u32 = b'C' as u32;
+pub const KEY_H: u32 = b'H' as u32;
+pub const KEY_V: u32 = b'V' as u32;
+pub const KEY_W: u32 = b'W' as u32;
+pub const KEY_X: u32 = b'X' as u32;
+pub const KEY_Z: u32 = b'Z' as u32;
+pub const KEY_TAB: u32 = 0x09;
+pub const KEY_SPACE: u32 = 0x20;
+pub const KEY_GRAVE: u32 = 0xC0;
 pub const KEY_ARROW_LEFT: u32 = 0x25;
 pub const KEY_ARROW_UP: u32 = 0x26;
 pub const KEY_ARROW_RIGHT: u32 = 0x27;
 pub const KEY_ARROW_DOWN: u32 = 0x28;
 
-pub fn is_backspace_key(key_code: u32) -> bool {
-    key_code == KEY_BACKSPACE
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct InputEvent {
+    pub event_type: c_int,
+    pub status: c_int,
+    pub key_code: c_uint,
+    pub modifier_flags: c_uint,
+    pub buffer: [c_char; 64],
+    pub buffer_len: usize,
+    pub source_buffer: [c_char; 256],
+    pub source_buffer_len: usize,
 }
 
-pub fn is_buffer_boundary_key(key_code: u32) -> bool {
-    matches!(
-        key_code,
-        KEY_ENTER | KEY_ESCAPE | KEY_ARROW_LEFT | KEY_ARROW_RIGHT | KEY_ARROW_DOWN | KEY_ARROW_UP
-    )
+impl InputEvent {
+    pub fn text(&self) -> String {
+        let len = self.buffer_len.min(self.buffer.len());
+        let bytes = self.buffer[..len]
+            .iter()
+            .map(|ch| *ch as u8)
+            .collect::<Vec<_>>();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    pub fn input_source_fingerprint(&self) -> String {
+        let len = self.source_buffer_len.min(self.source_buffer.len());
+        let bytes = self.source_buffer[..len]
+            .iter()
+            .map(|ch| *ch as u8)
+            .collect::<Vec<_>>();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    pub fn has_command_modifier(&self) -> bool {
+        let flags = self.modifier_flags;
+        flags & MODIFIER_COMMAND != 0
+    }
+
+    pub fn has_control_modifier(&self) -> bool {
+        let flags = self.modifier_flags;
+        flags & MODIFIER_CONTROL != 0
+    }
+
+    pub fn has_text_modifier(&self) -> bool {
+        let flags = self.modifier_flags;
+        flags & (MODIFIER_COMMAND | MODIFIER_CONTROL | MODIFIER_OPTION) != 0
+    }
+
+    pub fn is_buffered_replay(&self) -> bool {
+        let flags = self.modifier_flags;
+        flags & MODIFIER_BUFFERED_REPLAY != 0
+    }
+
+    pub fn is_rewrite_active(&self) -> bool {
+        let flags = self.modifier_flags;
+        flags & MODIFIER_REWRITE_ACTIVE != 0
+    }
 }
 
-pub fn inject_backspaces(count: usize, delay_ms: i32) {
-    unsafe { pal_pinyin_inject_backspaces(count as c_uint, delay_ms) };
-}
-
-pub fn inject_string(text: &str, delay_ms: i32) -> Result<()> {
-    let text = CString::new(text)?;
-    unsafe { pal_pinyin_inject_string(text.as_ptr(), delay_ms) };
+pub fn update_candidate_panel(
+    _preedit: &str,
+    _candidates: &[String],
+    _layout: CandidateLayout,
+) -> Result<()> {
     Ok(())
 }
 
-pub fn start_event_loop(callback: extern "C" fn(InputEvent)) -> ! {
+pub fn hide_candidate_panel() {}
+
+pub fn begin_rewrite_transaction() {
+    unsafe { pal_pinyin_begin_rewrite_transaction() };
+}
+
+pub fn cancel_rewrite_transaction() {
+    unsafe { pal_pinyin_abort_rewrite_transaction() };
+}
+
+pub fn commit_rewrite_transaction(
+    delete_chars: usize,
+    replacement_text: &str,
+    delay_ms: i32,
+) -> Result<()> {
+    let text = CString::new(replacement_text)
+        .context("replacement text contains an interior NUL byte and cannot be injected")?;
+    unsafe {
+        pal_pinyin_commit_rewrite_transaction(delete_chars as c_uint, text.as_ptr(), delay_ms);
+    }
+    Ok(())
+}
+
+pub fn start_event_loop(callback: extern "C" fn(InputEvent) -> c_int) -> ! {
     unsafe { pal_pinyin_start_event_loop(callback) };
     unreachable!("Windows event loop returned unexpectedly")
 }
 
 unsafe extern "C" {
-    fn pal_pinyin_start_event_loop(callback: extern "C" fn(InputEvent));
-    fn pal_pinyin_inject_backspaces(count: c_uint, delay_ms: c_int);
-    fn pal_pinyin_inject_string(string: *const c_char, delay_ms: c_int);
+    fn pal_pinyin_start_event_loop(callback: extern "C" fn(InputEvent) -> c_int);
+    fn pal_pinyin_begin_rewrite_transaction();
+    fn pal_pinyin_abort_rewrite_transaction();
+    fn pal_pinyin_commit_rewrite_transaction(
+        delete_chars: c_uint,
+        replacement_text: *const c_char,
+        delay_ms: c_int,
+    );
 }

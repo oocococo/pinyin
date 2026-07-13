@@ -1,4 +1,4 @@
-function Initialize-RimePocWindowsEnv {
+function Initialize-PinyinWindowsEnv {
     $cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
     if ((Test-Path $cargoBin) -and (($env:PATH -split ';') -notcontains $cargoBin)) {
         $env:PATH = "$cargoBin;$env:PATH"
@@ -43,4 +43,8 @@ function Initialize-RimePocWindowsEnv {
             $env:PATH = "$llvmBin;$env:PATH"
         }
     }
+}
+
+function Initialize-RimePocWindowsEnv {
+    Initialize-PinyinWindowsEnv
 }

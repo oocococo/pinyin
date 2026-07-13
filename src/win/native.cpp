@@ -31,6 +31,7 @@ extern "C" {
 enum {
   PAL_INPUT_EVENT_KEYBOARD = 1,
   PAL_INPUT_EVENT_MOUSE = 2,
+  PAL_INPUT_EVENT_CONTEXT = 3,
 };
 
 enum {
@@ -42,11 +43,14 @@ typedef struct {
   int32_t event_type;
   int32_t status;
   uint32_t key_code;
+  uint32_t modifier_flags;
   char buffer[64];
   uintptr_t buffer_len;
+  char source_buffer[256];
+  uintptr_t source_buffer_len;
 } PalInputEvent;
 
-typedef void (*PalEventCallback)(PalInputEvent event);
+typedef int32_t (*PalEventCallback)(PalInputEvent event);
 
 }
 
@@ -55,7 +59,7 @@ static PalEventCallback PAL_CALLBACK = nullptr;
 static bool PAL_LOG_EVENTS = false;
 
 static bool native_event_logging_enabled() {
-  const char *value = getenv("RIME_POC_NATIVE_LOG_EVENTS");
+  const char *value = getenv("PINYIN_NATIVE_LOG_EVENTS");
   if (value == nullptr) {
     return false;
   }
@@ -73,8 +77,32 @@ static void maybe_sleep(int32_t delay_ms) {
 
 static void dispatch_event(const PalInputEvent &event) {
   if (PAL_CALLBACK != nullptr) {
-    PAL_CALLBACK(event);
+    (void)PAL_CALLBACK(event);
   }
+}
+
+static bool key_is_down(int vkey) {
+  return (GetKeyState(vkey) & 0x8000) != 0;
+}
+
+static uint32_t current_modifier_flags() {
+  uint32_t flags = 0;
+  if (key_is_down(VK_CONTROL)) {
+    flags |= 1 << 1;
+  }
+  if (key_is_down(VK_MENU)) {
+    flags |= 1 << 2;
+  }
+  if (key_is_down(VK_LWIN) || key_is_down(VK_RWIN)) {
+    flags |= 1 << 0;
+  }
+  return flags;
+}
+
+static void set_system_input_source(PalInputEvent *event) {
+  static constexpr char source[] = "windows-system";
+  memcpy(event->source_buffer, source, sizeof(source) - 1);
+  event->source_buffer_len = sizeof(source) - 1;
 }
 
 static HKL foreground_keyboard_layout() {
@@ -130,7 +158,7 @@ static void process_keyboard_input(const RAWINPUT *raw) {
 
   if (raw->header.hDevice == nullptr) {
     if (PAL_LOG_EVENTS) {
-      fprintf(stderr, "[rime-poc native] skipped synthetic keyboard event\n");
+      fprintf(stderr, "[pinyin native] skipped synthetic keyboard event\n");
       fflush(stderr);
     }
     return;
@@ -141,6 +169,8 @@ static void process_keyboard_input(const RAWINPUT *raw) {
   event.event_type = PAL_INPUT_EVENT_KEYBOARD;
   event.status = is_pressed ? PAL_INPUT_STATUS_PRESSED : PAL_INPUT_STATUS_RELEASED;
   event.key_code = (uint32_t)raw->data.keyboard.VKey;
+  event.modifier_flags = current_modifier_flags();
+  set_system_input_source(&event);
 
   if (is_pressed) {
     BYTE keyboard_state[256] = {};
@@ -163,7 +193,7 @@ static void process_keyboard_input(const RAWINPUT *raw) {
 
   if (PAL_LOG_EVENTS) {
     fprintf(stderr,
-            "[rime-poc native] raw key status=%d key=%u text=%s len=%llu\n",
+            "[pinyin native] raw key status=%d key=%u text=%s len=%llu\n",
             event.status,
             event.key_code,
             event.buffer_len > 0 ? event.buffer : "<empty>",
@@ -191,6 +221,7 @@ static void process_mouse_input(const RAWINPUT *raw) {
 
   PalInputEvent event = {};
   event.event_type = PAL_INPUT_EVENT_MOUSE;
+  set_system_input_source(&event);
   if ((flags & down_flags) != 0) {
     event.status = PAL_INPUT_STATUS_PRESSED;
   } else if ((flags & up_flags) != 0) {
@@ -200,7 +231,7 @@ static void process_mouse_input(const RAWINPUT *raw) {
   }
 
   if (PAL_LOG_EVENTS) {
-    fprintf(stderr, "[rime-poc native] raw mouse status=%d\n", event.status);
+    fprintf(stderr, "[pinyin native] raw mouse status=%d\n", event.status);
     fflush(stderr);
   }
 
@@ -266,7 +297,7 @@ static HWND create_raw_input_window() {
   if (!RegisterClassExW(&window_class)) {
     DWORD error = GetLastError();
     if (error != ERROR_CLASS_ALREADY_EXISTS) {
-      fprintf(stderr, "[rime-poc native] failed to register Raw Input window class: %lu\n", error);
+      fprintf(stderr, "[pinyin native] failed to register Raw Input window class: %lu\n", error);
       fflush(stderr);
       return nullptr;
     }
@@ -275,7 +306,7 @@ static HWND create_raw_input_window() {
   HWND window = CreateWindowExW(
       0,
       PAL_WINDOW_CLASS,
-      L"rime-poc Raw Input Window",
+      L"pinyin Raw Input Window",
       WS_OVERLAPPEDWINDOW,
       CW_USEDEFAULT,
       CW_USEDEFAULT,
@@ -286,7 +317,7 @@ static HWND create_raw_input_window() {
       GetModuleHandleW(nullptr),
       nullptr);
   if (window == nullptr) {
-    fprintf(stderr, "[rime-poc native] failed to create Raw Input window: %lu\n", GetLastError());
+    fprintf(stderr, "[pinyin native] failed to create Raw Input window: %lu\n", GetLastError());
     fflush(stderr);
     return nullptr;
   }
@@ -303,7 +334,7 @@ static HWND create_raw_input_window() {
   devices[1].hwndTarget = window;
 
   if (!RegisterRawInputDevices(devices, 2, sizeof(devices[0]))) {
-    fprintf(stderr, "[rime-poc native] failed to register Raw Input devices: %lu\n", GetLastError());
+    fprintf(stderr, "[pinyin native] failed to register Raw Input devices: %lu\n", GetLastError());
     fflush(stderr);
     DestroyWindow(window);
     return nullptr;
@@ -341,7 +372,7 @@ extern "C" void pal_pinyin_start_event_loop(PalEventCallback callback) {
   PAL_LOG_EVENTS = native_event_logging_enabled();
 
   fprintf(stderr,
-          "[rime-poc native] starting Win32 Raw Input event loop pid=%lu log_events=%s\n",
+          "[pinyin native] starting Win32 Raw Input event loop pid=%lu log_events=%s\n",
           GetCurrentProcessId(),
           PAL_LOG_EVENTS ? "true" : "false");
   fflush(stderr);
@@ -360,9 +391,9 @@ extern "C" void pal_pinyin_start_event_loop(PalEventCallback callback) {
   }
 }
 
-extern "C" void pal_pinyin_inject_backspaces(uint32_t count, int32_t delay_ms) {
+static void inject_backspaces(uint32_t count, int32_t delay_ms) {
   fprintf(stderr,
-          "[rime-poc native] injecting backspaces count=%u delay_ms=%d\n",
+          "[pinyin native] injecting backspaces count=%u delay_ms=%d\n",
           count,
           delay_ms);
   fflush(stderr);
@@ -389,7 +420,7 @@ extern "C" void pal_pinyin_inject_backspaces(uint32_t count, int32_t delay_ms) {
   }
 }
 
-extern "C" void pal_pinyin_inject_string(const char *string, int32_t delay_ms) {
+static void inject_string(const char *string, int32_t delay_ms) {
   if (string == nullptr) {
     return;
   }
@@ -415,7 +446,7 @@ extern "C" void pal_pinyin_inject_string(const char *string, int32_t delay_ms) {
     wide.pop_back();
   }
 
-  fprintf(stderr, "[rime-poc native] injecting unicode text delay_ms=%d\n", delay_ms);
+  fprintf(stderr, "[pinyin native] injecting unicode text delay_ms=%d\n", delay_ms);
   fflush(stderr);
 
   if (delay_ms <= 0) {
@@ -438,4 +469,16 @@ extern "C" void pal_pinyin_inject_string(const char *string, int32_t delay_ms) {
     send_inputs(&up);
     maybe_sleep(delay_ms);
   }
+}
+
+extern "C" void pal_pinyin_begin_rewrite_transaction() {}
+
+extern "C" void pal_pinyin_abort_rewrite_transaction() {}
+
+extern "C" void pal_pinyin_commit_rewrite_transaction(
+    uint32_t delete_chars,
+    const char *replacement_text,
+    int32_t delay_ms) {
+  inject_backspaces(delete_chars, delay_ms);
+  inject_string(replacement_text, delay_ms);
 }

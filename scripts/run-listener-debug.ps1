@@ -3,25 +3,25 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $RepoRoot
 
-if (!$env:RIME_POC_NATIVE_LOG_EVENTS) {
-    $env:RIME_POC_NATIVE_LOG_EVENTS = "1"
+if (!$env:PINYIN_NATIVE_LOG_EVENTS) {
+    $env:PINYIN_NATIVE_LOG_EVENTS = "1"
 }
 
-$logDir = if ($env:RIME_POC_LOG_DIR) {
-    $env:RIME_POC_LOG_DIR
+$logDir = if ($env:PINYIN_LOG_DIR) {
+    $env:PINYIN_LOG_DIR
 } else {
     Join-Path $RepoRoot "logs"
 }
 
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
-$logFile = if ($env:RIME_POC_LOG_FILE) {
-    $env:RIME_POC_LOG_FILE
+$logFile = if ($env:PINYIN_LOG_FILE) {
+    $env:PINYIN_LOG_FILE
 } else {
-    Join-Path $logDir "rime-poc-listener-$timestamp.log"
+    Join-Path $logDir "pinyin-listener-$timestamp.log"
 }
 
-Write-Host "rime-poc debug listener log:"
+Write-Host "pinyin debug listener log:"
 Write-Host "  $logFile"
 Write-Host ""
 

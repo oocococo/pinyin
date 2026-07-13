@@ -240,6 +240,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19b17cddbe7ec3f8bc800887bab5e717348c95ea2ca0b1bf0837fb964dc67099"
 
 [[package]]
+name = "pinyin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cc",
+ "librime-sys",
+ "rime-api",
+ "serde",
+ "toml",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -297,17 +309,6 @@ dependencies = [
  "librime-sys",
  "once_cell",
  "thiserror",
-]
-
-[[package]]
-name = "rime-poc"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cc",
- "rime-api",
- "serde",
- "toml",
 ]
 
 [[package]]

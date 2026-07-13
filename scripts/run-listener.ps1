@@ -3,7 +3,7 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $RepoRoot
 . (Join-Path $PSScriptRoot "windows-env.ps1")
-Initialize-RimePocWindowsEnv
+Initialize-PinyinWindowsEnv
 
 if (!$env:RIME_SHARED_DATA_DIR) {
     $env:RIME_SHARED_DATA_DIR = Join-Path $RepoRoot "data\shared"
@@ -78,7 +78,7 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
-$exe = Join-Path $RepoRoot "target\x86_64-pc-windows-gnu\debug\rime-poc.exe"
+$exe = Join-Path $RepoRoot "target\x86_64-pc-windows-gnu\debug\pinyin.exe"
 $previousPreference = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
 & $exe --listen @args 2>&1 | ForEach-Object { Write-Output ($_.ToString()) }

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-data_dir="${RIME_POC_DATA_DIR:-$root_dir/data}"
+data_dir="${PINYIN_DATA_DIR:-$root_dir/data}"
 package_dir="$data_dir/packages"
 shared_dir="$data_dir/shared"
 user_dir="$data_dir/user"
@@ -46,6 +46,20 @@ copy_package_files "$package_dir/rime-essay"
 copy_package_files "$package_dir/rime-luna-pinyin"
 copy_package_files "$package_dir/rime-pinyin-simp"
 
+if ! command -v brew >/dev/null 2>&1; then
+  echo "error: Homebrew is required to locate OpenCC conversion data" >&2
+  exit 1
+fi
+
+opencc_data_dir="$(brew --prefix opencc)/share/opencc"
+if [[ ! -d "$opencc_data_dir" ]]; then
+  echo "error: OpenCC conversion data not found: $opencc_data_dir" >&2
+  exit 1
+fi
+
+mkdir -p "$shared_dir/opencc"
+cp -R "$opencc_data_dir"/. "$shared_dir/opencc"/
+
 cat > "$user_dir/default.custom.yaml" <<'YAML'
 patch:
   schema_list:
@@ -58,6 +72,7 @@ cat <<EOF
 Rime data downloaded.
 shared: $shared_dir
 user:   $user_dir
+opencc: $shared_dir/opencc
 
 export RIME_SHARED_DATA_DIR="$shared_dir"
 export RIME_USER_DATA_DIR="$user_dir"

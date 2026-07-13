@@ -71,7 +71,7 @@ $libDir = if ($env:RIME_LIB_DIR) {
     $found
 }
 
-Write-Host "rime-poc Windows librime check"
+Write-Host "pinyin Windows librime check"
 Write-Host "include dir: $includeDir"
 Write-Host "lib dir:     $libDir"
 

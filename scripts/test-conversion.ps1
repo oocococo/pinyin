@@ -3,7 +3,7 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $RepoRoot
 . (Join-Path $PSScriptRoot "windows-env.ps1")
-Initialize-RimePocWindowsEnv
+Initialize-PinyinWindowsEnv
 
 if (!$env:RIME_SHARED_DATA_DIR) {
     $env:RIME_SHARED_DATA_DIR = Join-Path $RepoRoot "data\shared"
@@ -78,6 +78,34 @@ if ($args.Count -gt 0) {
     exit $LASTEXITCODE
 }
 
+function Get-TomlString {
+    param([string] $Key)
+
+    $line = Get-Content pinyin.toml |
+        Where-Object { $_ -match "^\s*$Key\s*=\s*`"(.*)`"\s*$" } |
+        Select-Object -First 1
+    if (!$line) {
+        throw "unable to read $Key from pinyin.toml"
+    }
+    return ([regex]::Match($line, "^\s*$Key\s*=\s*`"(.*)`"\s*$")).Groups[1].Value
+}
+
+$triggerPrefix = if ($env:PINYIN_TEST_TRIGGER_PREFIX) {
+    $env:PINYIN_TEST_TRIGGER_PREFIX
+} else {
+    Get-TomlString "trigger_prefix"
+}
+$triggerSuffix = if ($env:PINYIN_TEST_TRIGGER_SUFFIX) {
+    $env:PINYIN_TEST_TRIGGER_SUFFIX
+} else {
+    Get-TomlString "trigger_suffix"
+}
+
+function New-TriggeredText {
+    param([string] $Body)
+    "$triggerPrefix$Body$triggerSuffix"
+}
+
 & cargo fmt --check
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
@@ -116,13 +144,13 @@ function From-Utf8Base64 {
     [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Value))
 }
 
-Invoke-ConversionCase ';;hao,zaijian,nihaoma,woyaoceshi;;' `
+Invoke-ConversionCase (New-TriggeredText 'hao,zaijian,nihaoma,woyaoceshi') `
     (From-Utf8Base64 '5aW977yM5YaN6KeB77yM5L2g5aW95ZCX77yM5oiR6KaB5rWL6K+V')
-Invoke-ConversionCase ';;woyaoceshizhongwenshurufa,nihaoma!hao...zaijian-jiahao+wenhao~;;' `
+Invoke-ConversionCase (New-TriggeredText 'woyaoceshizhongwenshurufa,nihaoma!hao...zaijian-jiahao+wenhao~') `
     (From-Utf8Base64 '5oiR6KaB5rWL6K+V5Lit5paH6L6T5YWl5rOV77yM5L2g5aW95ZCX77yB5aW94oCm4oCm5YaN6KeB77yN5Yqg5Y+377yL6Zeu5Y+3772e')
-Invoke-ConversionCase (From-Utf8Base64 'OztoYW/igKbigKZ6YWlqaWFuLG5paGFvbWE7Ow==') `
+Invoke-ConversionCase (New-TriggeredText (From-Utf8Base64 'aGFv4oCm4oCmemFpamlhbixuaWhhb21h')) `
     (From-Utf8Base64 '5aW94oCm4oCm5YaN6KeB77yM5L2g5aW95ZCX')
-Invoke-ConversionCase ';;wo ai OpenAI,yong Rust kaifa;;' `
+Invoke-ConversionCase (New-TriggeredText 'wo ai OpenAI,yong Rust kaifa') `
     (From-Utf8Base64 '5oiR54ixT3BlbkFJ77yM55SoUnVzdOW8gOWPkQ==') `
     -ExtraArgs @("--conversion-mode", "rime-auto")
 

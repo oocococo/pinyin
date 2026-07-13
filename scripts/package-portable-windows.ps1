@@ -4,7 +4,7 @@ $RepoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $RepoRoot
 
 . (Join-Path $PSScriptRoot "windows-env.ps1")
-Initialize-RimePocWindowsEnv
+Initialize-PinyinWindowsEnv
 
 if (!(Get-Command cargo -ErrorAction SilentlyContinue)) {
     Write-Error "cargo was not found. Install Rust for Windows, then open a new PowerShell window."
@@ -46,19 +46,19 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
-$portableDir = Join-Path $RepoRoot "dist\rime-poc-windows-portable"
-$zipPath = Join-Path $RepoRoot "dist\rime-poc-windows-portable.zip"
+$portableDir = Join-Path $RepoRoot "dist\pinyin-windows-portable"
+$zipPath = Join-Path $RepoRoot "dist\pinyin-windows-portable.zip"
 $dllDir = Join-Path $portableDir "bin"
 $dataDir = Join-Path $portableDir "data"
-$exeSource = Join-Path $RepoRoot "target\x86_64-pc-windows-gnu\release\rime-poc.exe"
-$exeDest = Join-Path $portableDir "rime-poc.exe"
+$exeSource = Join-Path $RepoRoot "target\x86_64-pc-windows-gnu\release\pinyin.exe"
+$exeDest = Join-Path $portableDir "pinyin.exe"
 
 Remove-Item -LiteralPath $portableDir -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $dllDir, (Join-Path $dataDir "shared"), (Join-Path $dataDir "user") | Out-Null
 
 Copy-Item -LiteralPath $exeSource -Destination $exeDest
-Copy-Item -LiteralPath "rime-poc.toml" -Destination (Join-Path $portableDir "rime-poc.toml")
+Copy-Item -LiteralPath "pinyin.toml" -Destination (Join-Path $portableDir "pinyin.toml")
 Copy-Item -Path "data\shared\*" -Destination (Join-Path $dataDir "shared") -Recurse
 if (Test-Path "data\user\default.custom.yaml") {
     Copy-Item -LiteralPath "data\user\default.custom.yaml" -Destination (Join-Path $dataDir "user\default.custom.yaml")
@@ -145,7 +145,7 @@ $env:RIME_SHARED_DATA_DIR = if ($env:RIME_SHARED_DATA_DIR) { $env:RIME_SHARED_DA
 $env:RIME_USER_DATA_DIR = if ($env:RIME_USER_DATA_DIR) { $env:RIME_USER_DATA_DIR } else { Join-Path $root "data\user" }
 $env:RIME_SCHEMA = if ($env:RIME_SCHEMA) { $env:RIME_SCHEMA } else { "luna_pinyin_simp" }
 
-& (Join-Path $root "rime-poc.exe") --listen @ArgsForListener
+& (Join-Path $root "pinyin.exe") --listen @ArgsForListener
 exit $LASTEXITCODE
 '@ | Set-Content -LiteralPath (Join-Path $portableDir "run-listener.ps1") -Encoding ASCII
 
@@ -161,23 +161,23 @@ $env:PATH = (Join-Path $root "bin") + ";" + $env:PATH
 $env:RIME_SHARED_DATA_DIR = if ($env:RIME_SHARED_DATA_DIR) { $env:RIME_SHARED_DATA_DIR } else { Join-Path $root "data\shared" }
 $env:RIME_USER_DATA_DIR = if ($env:RIME_USER_DATA_DIR) { $env:RIME_USER_DATA_DIR } else { Join-Path $root "data\user" }
 $env:RIME_SCHEMA = if ($env:RIME_SCHEMA) { $env:RIME_SCHEMA } else { "luna_pinyin_simp" }
-$env:RIME_POC_NATIVE_LOG_EVENTS = if ($env:RIME_POC_NATIVE_LOG_EVENTS) { $env:RIME_POC_NATIVE_LOG_EVENTS } else { "1" }
+$env:PINYIN_NATIVE_LOG_EVENTS = if ($env:PINYIN_NATIVE_LOG_EVENTS) { $env:PINYIN_NATIVE_LOG_EVENTS } else { "1" }
 
-$logDir = if ($env:RIME_POC_LOG_DIR) { $env:RIME_POC_LOG_DIR } else { Join-Path $root "logs" }
+$logDir = if ($env:PINYIN_LOG_DIR) { $env:PINYIN_LOG_DIR } else { Join-Path $root "logs" }
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
-$logFile = if ($env:RIME_POC_LOG_FILE) {
-    $env:RIME_POC_LOG_FILE
+$logFile = if ($env:PINYIN_LOG_FILE) {
+    $env:PINYIN_LOG_FILE
 } else {
-    Join-Path $logDir ("rime-poc-listener-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".log")
+    Join-Path $logDir ("pinyin-listener-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".log")
 }
 
-Write-Host "rime-poc debug listener log:"
+Write-Host "pinyin debug listener log:"
 Write-Host "  $logFile"
 Write-Host ""
 
 $previousPreference = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
-& (Join-Path $root "rime-poc.exe") --doctor --listen --log-events @ArgsForListener 2>&1 |
+& (Join-Path $root "pinyin.exe") --doctor --listen --log-events @ArgsForListener 2>&1 |
     ForEach-Object { $_.ToString() } |
     Tee-Object -FilePath $logFile -Append
 $listenerExitCode = $LASTEXITCODE
@@ -186,13 +186,13 @@ exit $listenerExitCode
 '@ | Set-Content -LiteralPath (Join-Path $portableDir "run-listener-debug.ps1") -Encoding ASCII
 
 @'
-rime-poc portable Windows package
+pinyin portable Windows package
 
 This directory bundles:
-  - rime-poc.exe
+  - pinyin.exe
   - MinGW/librime DLL dependencies under bin\
   - Rime shared/user data under data\
-  - rime-poc.toml trigger and conversion config
+  - pinyin.toml trigger and conversion config
 
 No MSYS2 or librime install is required on the target Windows machine.
 
@@ -203,7 +203,7 @@ No MSYS2 or librime install is required on the target Windows machine.
    powershell -ExecutionPolicy Bypass -File .\run-listener-debug.ps1
 
 2. Type a trigger in any normal text field:
-   ;;woyaoceshizhongwenshurufa,nihaoma!;;
+   ''woyaoceshizhongwenshurufa,nihaoma!''
 
 Expected output:
    我要测试中文输入法，你好吗！
@@ -211,12 +211,12 @@ Expected output:
 Experimental mixed Chinese/English mode:
    powershell -ExecutionPolicy Bypass -File .\run-listener.ps1 --conversion-mode rime-auto
 
-Or edit rime-poc.toml:
+Or edit pinyin.toml:
    conversion_mode = "rime-auto"
 
 Notes:
   - Windows does not need macOS-style Accessibility/Input Monitoring permission.
-  - Injected input may not reach elevated apps unless rime-poc.exe also runs elevated.
+  - Injected input may not reach elevated apps unless pinyin.exe also runs elevated.
 '@ | Set-Content -LiteralPath (Join-Path $portableDir "README.txt") -Encoding UTF8
 
 $oldPath = $env:PATH

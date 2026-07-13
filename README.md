@@ -1,15 +1,17 @@
 # rime-poc
 
 Minimal PoC for calling `librime` from Rust, converting captured pinyin into
-the first Rime candidate, and running a macOS listener that deletes the trigger
-text and injects the converted result.
+the first Rime candidate, and running a macOS/Windows listener that deletes the
+trigger text and injects the converted result.
 
 This is intentionally separate from the espanso workspace. It only validates
 the first usable flow before moving anything into a real product repository.
 
 ## Prerequisites
 
-Install `librime` and Rime schema data first. On macOS, the fastest dev setup is:
+Install `librime` and Rime schema data first.
+
+On macOS, the fastest dev setup is:
 
 ```sh
 brew install librime
@@ -33,6 +35,23 @@ export RIME_INCLUDE_DIR="$(brew --prefix librime)/include"
 export RIME_LIB_DIR="$(brew --prefix librime)/lib"
 ```
 
+On Windows, use a native Windows GNU toolchain through MSYS2. This keeps the
+Win32 listener running as a real Windows executable while reusing MSYS2's
+prebuilt `librime` package:
+
+```powershell
+winget install --id Rustlang.Rustup --exact
+winget install --id LLVM.LLVM --exact
+winget install --id MSYS2.MSYS2 --exact
+C:\msys64\usr\bin\bash.exe -lc 'pacman --noconfirm -Syu'
+C:\msys64\usr\bin\bash.exe -lc 'pacman --noconfirm -S --needed mingw-w64-x86_64-gcc mingw-w64-x86_64-librime git'
+rustup target add x86_64-pc-windows-gnu
+```
+
+The PowerShell helper scripts automatically use `C:\msys64\mingw64\include`,
+`C:\msys64\mingw64\lib`, `C:\Program Files\LLVM\bin`, and the GNU linker when
+those defaults exist.
+
 You also need Rime data such as `prelude`, `essay`, and either `luna-pinyin` or
 `pinyin-simp`. Point the CLI at those directories with:
 
@@ -40,6 +59,14 @@ You also need Rime data such as `prelude`, `essay`, and either `luna-pinyin` or
 export RIME_SHARED_DATA_DIR=/path/to/rime-data
 export RIME_USER_DATA_DIR="$HOME/Library/Rime"
 export RIME_SCHEMA=luna_pinyin_simp
+```
+
+On Windows, a typical local-data setup is:
+
+```powershell
+$env:RIME_SHARED_DATA_DIR = "$PWD\data\shared"
+$env:RIME_USER_DATA_DIR = "$env:APPDATA\Rime"
+$env:RIME_SCHEMA = "luna_pinyin_simp"
 ```
 
 When using Squirrel's installed data, the shared directory is commonly:
@@ -82,10 +109,22 @@ Run the dependency check without compiling Rust:
 bash scripts/check-librime.sh
 ```
 
+On Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\check-librime.ps1
+```
+
 Run the full local conversion smoke test:
 
 ```sh
 bash scripts/test-conversion.sh
+```
+
+On Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\test-conversion.ps1
 ```
 
 Or pass one trigger text to test a single case:
@@ -94,17 +133,38 @@ Or pass one trigger text to test a single case:
 bash scripts/test-conversion.sh ';;"hao","zaijian";;'
 ```
 
-Start the macOS listener:
+Start the listener directly:
+
+```sh
+cargo run -- --listen
+```
+
+On macOS, the wrapper script does the same with the project defaults:
 
 ```sh
 bash scripts/run-listener.sh
 ```
 
-The listener uses Cocoa global keyboard monitoring and CGEvent injection. macOS
-must grant Accessibility permission to the terminal app or compiled binary. If
-permission is missing, the CLI opens the Accessibility settings page, prints the
-exact next step, and waits for you to press Enter after granting permission. When
-it is running, type a configured trigger such as:
+On Windows, use the PowerShell wrapper after setting `RIME_INCLUDE_DIR` and
+`RIME_LIB_DIR`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\run-listener.ps1
+```
+
+The macOS listener uses CGEventTap/NSEvent monitoring and CGEvent injection.
+macOS must grant Accessibility permission to the terminal app or compiled
+binary, plus Input Monitoring for global key events. If permission is missing,
+the CLI opens the relevant settings page, prints the exact next step, and waits
+for you to press Enter after granting permission.
+
+The Windows listener follows Espanso's architecture: Win32 Raw Input captures
+keyboard/mouse events through a hidden window, and SendInput deletes the trigger
+text and injects Unicode output. It does not require the macOS privacy prompts,
+but injected input may not reach elevated apps unless `rime-poc` runs at the
+same privilege level.
+
+When it is running, type a configured trigger such as:
 
 ```text
 ;;woyaoceshizhongwenshurufa,nihaoma!;;
@@ -119,18 +179,25 @@ The listener deletes the full trigger text with Backspace and injects:
 Useful listener flags:
 
 ```sh
+cargo run -- --listen --max-buffer-chars 4096 --inject-delay-ms 1
+cargo run -- --listen --log-events
 bash scripts/run-listener.sh --max-buffer-chars 4096 --inject-delay-ms 1
 bash scripts/run-listener.sh --log-events
 ```
 
-For diagnosis, run the debug wrapper. It prints doctor output, turns on native
-and Rust event logs, and writes the same output to `logs/`:
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\run-listener.ps1 --max-buffer-chars 4096 --inject-delay-ms 1
+powershell -ExecutionPolicy Bypass -File scripts\run-listener-debug.ps1
+```
+
+For macOS diagnosis, run the debug wrapper. It prints doctor output, turns on
+native and Rust event logs, and writes the same output to `logs/`:
 
 ```sh
 bash scripts/run-listener-debug.sh
 ```
 
-Package a standalone release binary directory:
+Package a standalone macOS release binary directory:
 
 ```sh
 bash scripts/package-binary.sh
@@ -190,6 +257,30 @@ permissions to `rime-poc-macos-portable/rime-poc`, then run:
 The portable zip does not require Homebrew on the target Mac. macOS permissions
 still need to be granted per machine.
 
+Package a portable Windows zip that bundles `rime-poc.exe`, MinGW/librime DLL
+dependencies, and the Rime data files:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\package-portable-windows.ps1
+```
+
+The portable directory and zip are written to:
+
+```text
+dist\rime-poc-windows-portable
+dist\rime-poc-windows-portable.zip
+```
+
+On the target Windows machine, unzip it, then run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run-listener.ps1
+```
+
+The portable zip does not require MSYS2 or a separate `librime` install on the
+target machine. Injected input may not reach elevated apps unless `rime-poc.exe`
+also runs elevated.
+
 Download minimal Rime data for this PoC:
 
 ```sh
@@ -203,6 +294,12 @@ The CLI/listener strips the configured prefix/suffix. In the default
 `segmented` mode, it splits the body into pinyin runs and separators, sends each
 pinyin run to Rime independently, then rejoins the converted text. Half-width
 separators are converted where there is a Chinese punctuation equivalent:
+
+On Windows, run the same downloader through MSYS2 bash:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\download-rime-data.ps1
+```
 
 ```text
 ,  -> ，

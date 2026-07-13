@@ -1,9 +1,14 @@
 use std::{
     env, fs,
-    io::{self, Write as _},
     path::{Path, PathBuf},
-    process::{self, Command},
+    process,
     sync::{Mutex, OnceLock},
+};
+
+#[cfg(target_os = "macos")]
+use std::{
+    io::{self, Write as _},
+    process::Command,
 };
 
 use anyhow::{anyhow, bail, Context as _, Result};
@@ -13,8 +18,8 @@ use rime_api::{
 };
 use serde::Deserialize;
 
-#[cfg(target_os = "macos")]
-mod mac;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+mod platform;
 
 const DEFAULT_CONFIG_FILE: &str = "rime-poc.toml";
 const DEFAULT_TRIGGER: &str = ";;";
@@ -22,7 +27,7 @@ const DEFAULT_MAX_BUFFER_CHARS: usize = 4096;
 const DEFAULT_INJECT_DELAY_MS: i32 = 1;
 const MIN_MAX_BUFFER_CHARS: usize = 16;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 static LISTENER_RUNTIME: OnceLock<Mutex<ListenerRuntime>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
@@ -97,7 +102,7 @@ struct CaptureState {
     max_buffer_chars: usize,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 #[derive(Debug)]
 struct ListenerRuntime {
     options: Options,
@@ -481,10 +486,9 @@ fn run_conversion(options: &Options, body: String) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn run_listener(options: Options) -> Result<()> {
-    ensure_accessibility_interactive()?;
-    ensure_input_monitoring_interactive()?;
+    ensure_listener_platform_ready()?;
 
     match full_deploy_and_wait() {
         DeployResult::Success => {}
@@ -504,8 +508,8 @@ fn run_listener(options: Options) -> Result<()> {
         .map_err(|_| anyhow!("listener runtime lock is poisoned"))?;
     println!("rime-poc listener started");
     println!("pid:             {}", process::id());
-    println!("accessibility:   {}", mac::is_accessibility_trusted(false));
-    println!("input_monitoring: {}", mac::has_input_monitoring_access());
+    println!("platform:        {}", platform::PLATFORM_NAME);
+    print_listener_platform_status();
     println!("schema:          {}", runtime.options.schema);
     println!(
         "trigger_prefix:  {:?}",
@@ -515,17 +519,53 @@ fn run_listener(options: Options) -> Result<()> {
         "trigger_suffix:  {:?}",
         runtime.options.config.trigger_suffix
     );
+    println!(
+        "conversion_mode: {}",
+        runtime.options.config.conversion_mode.as_str()
+    );
     println!("max_buffer_chars: {}", runtime.options.max_buffer_chars);
     println!("inject_delay_ms: {}", runtime.options.inject_delay_ms);
     println!("log_events:      {}", runtime.options.log_events);
     drop(runtime);
 
-    mac::start_event_loop(mac_event_callback);
+    platform::start_event_loop(platform_event_callback);
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_listener_platform_ready() -> Result<()> {
+    ensure_accessibility_interactive()?;
+    ensure_input_monitoring_interactive()?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_listener_platform_ready() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn print_listener_platform_status() {
+    println!(
+        "accessibility:   {}",
+        platform::is_accessibility_trusted(false)
+    );
+    println!(
+        "input_monitoring: {}",
+        platform::has_input_monitoring_access()
+    );
+    println!("input_backend:   CGEventTap/NSEvent");
+    println!("inject_backend:  CGEventPost");
+}
+
+#[cfg(target_os = "windows")]
+fn print_listener_platform_status() {
+    println!("input_backend:   Win32 Raw Input");
+    println!("inject_backend:  SendInput");
 }
 
 #[cfg(target_os = "macos")]
 fn ensure_accessibility_interactive() -> Result<()> {
-    if mac::is_accessibility_trusted(false) {
+    if platform::is_accessibility_trusted(false) {
         return Ok(());
     }
 
@@ -535,7 +575,7 @@ fn ensure_accessibility_interactive() -> Result<()> {
     eprintln!("Enable the current terminal app or the rime-poc binary, then return here.");
     eprintln!();
 
-    let _ = mac::is_accessibility_trusted(true);
+    let _ = platform::is_accessibility_trusted(true);
     open_accessibility_settings();
 
     loop {
@@ -554,7 +594,7 @@ fn ensure_accessibility_interactive() -> Result<()> {
             bail!("Accessibility permission was not granted");
         }
 
-        if mac::is_accessibility_trusted(false) {
+        if platform::is_accessibility_trusted(false) {
             eprintln!("Accessibility permission detected. Starting listener.");
             return Ok(());
         }
@@ -567,7 +607,7 @@ fn ensure_accessibility_interactive() -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn ensure_input_monitoring_interactive() -> Result<()> {
-    if mac::has_input_monitoring_access() {
+    if platform::has_input_monitoring_access() {
         return Ok(());
     }
 
@@ -579,7 +619,7 @@ fn ensure_input_monitoring_interactive() -> Result<()> {
     eprintln!("Enable the rime-poc binary, then return here.");
     eprintln!();
 
-    let _ = mac::request_input_monitoring_access();
+    let _ = platform::request_input_monitoring_access();
     open_input_monitoring_settings();
 
     loop {
@@ -600,7 +640,7 @@ fn ensure_input_monitoring_interactive() -> Result<()> {
             bail!("Input Monitoring permission was not granted");
         }
 
-        if mac::has_input_monitoring_access() {
+        if platform::has_input_monitoring_access() {
             eprintln!("Input Monitoring permission detected. Starting listener.");
             return Ok(());
         }
@@ -659,13 +699,13 @@ fn open_settings_pane(label: &str, url: &str) {
     eprintln!("Unable to open System Settings automatically; please open it manually.");
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn run_listener(_options: Options) -> Result<()> {
-    bail!("--listen is only supported on macOS")
+    bail!("--listen is only supported on macOS and Windows")
 }
 
-#[cfg(target_os = "macos")]
-extern "C" fn mac_event_callback(event: mac::InputEvent) {
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+extern "C" fn platform_event_callback(event: platform::InputEvent) {
     let Some(runtime) = LISTENER_RUNTIME.get() else {
         return;
     };
@@ -824,18 +864,18 @@ impl CaptureState {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 impl ListenerRuntime {
-    fn handle_event(&mut self, event: mac::InputEvent) -> Result<()> {
+    fn handle_event(&mut self, event: platform::InputEvent) -> Result<()> {
         if self.options.log_events {
             self.log_event(&event);
         }
 
-        if event.status != mac::STATUS_PRESSED {
+        if event.status != platform::STATUS_PRESSED {
             return Ok(());
         }
 
-        if event.event_type == mac::EVENT_MOUSE {
+        if event.event_type == platform::EVENT_MOUSE {
             if self.options.log_events {
                 println!("[listener] mouse event -> clear buffer");
             }
@@ -843,35 +883,27 @@ impl ListenerRuntime {
             return Ok(());
         }
 
-        if event.event_type != mac::EVENT_KEYBOARD {
+        if event.event_type != platform::EVENT_KEYBOARD {
             return Ok(());
         }
 
-        match event.key_code {
-            mac::KEY_BACKSPACE => {
-                self.capture.backspace();
-                if self.options.log_events {
-                    println!(
-                        "[listener] backspace -> buffer_chars={}",
-                        self.capture.buffer.chars().count()
-                    );
-                }
-                return Ok(());
+        if platform::is_backspace_key(event.key_code) {
+            self.capture.backspace();
+            if self.options.log_events {
+                println!(
+                    "[listener] backspace -> buffer_chars={}",
+                    self.capture.buffer.chars().count()
+                );
             }
-            mac::KEY_ENTER
-            | mac::KEY_RETURN
-            | mac::KEY_ESCAPE
-            | mac::KEY_ARROW_LEFT
-            | mac::KEY_ARROW_RIGHT
-            | mac::KEY_ARROW_DOWN
-            | mac::KEY_ARROW_UP => {
-                self.capture.clear();
-                if self.options.log_events {
-                    println!("[listener] key {} -> clear buffer", event.key_code);
-                }
-                return Ok(());
+            return Ok(());
+        }
+
+        if platform::is_buffer_boundary_key(event.key_code) {
+            self.capture.clear();
+            if self.options.log_events {
+                println!("[listener] key {} -> clear buffer", event.key_code);
             }
-            _ => {}
+            return Ok(());
         }
 
         let text = event.text();
@@ -916,14 +948,14 @@ impl ListenerRuntime {
             output.output.chars().count()
         );
 
-        mac::inject_backspaces(delete_count, self.options.inject_delay_ms);
-        mac::inject_string(&output.output, self.options.inject_delay_ms)?;
+        platform::inject_backspaces(delete_count, self.options.inject_delay_ms);
+        platform::inject_string(&output.output, self.options.inject_delay_ms)?;
 
         println!("converted: {:?} -> {:?}", matched.full_text, output.output);
         Ok(())
     }
 
-    fn log_event(&self, event: &mac::InputEvent) {
+    fn log_event(&self, event: &platform::InputEvent) {
         println!(
             "[event] type={} status={} key={} text={:?} buffer_chars={}",
             event.event_type,
@@ -1123,6 +1155,14 @@ fn default_shared_data_dir() -> PathBuf {
         return path;
     }
 
+    if let Some(path) = local_data_dir("shared") {
+        return path;
+    }
+
+    if cfg!(target_os = "windows") {
+        return PathBuf::from("data").join("shared");
+    }
+
     let candidates = [
         "/Library/Input Methods/Squirrel.app/Contents/SharedSupport",
         "/opt/homebrew/share/rime-data",
@@ -1142,6 +1182,22 @@ fn default_user_data_dir() -> PathBuf {
         return path;
     }
 
+    if let Some(path) = local_data_dir("user") {
+        return path;
+    }
+
+    if cfg!(target_os = "windows") {
+        if let Some(app_data) = env::var_os("APPDATA") {
+            return PathBuf::from(app_data).join("Rime");
+        }
+
+        if let Some(home) = home_dir() {
+            return home.join("AppData").join("Roaming").join("Rime");
+        }
+
+        return PathBuf::from("rime-user");
+    }
+
     home_dir()
         .map(|home| home.join("Library/Rime"))
         .unwrap_or_else(|| PathBuf::from("rime-user"))
@@ -1152,8 +1208,23 @@ fn packaged_data_dir(name: &str) -> Option<PathBuf> {
     path.exists().then_some(path)
 }
 
+fn local_data_dir(name: &str) -> Option<PathBuf> {
+    let path = PathBuf::from("data").join(name);
+    path.exists().then_some(path)
+}
+
 fn home_dir() -> Option<PathBuf> {
-    env::var_os("HOME").map(PathBuf::from)
+    if let Some(home) = env::var_os("HOME") {
+        return Some(PathBuf::from(home));
+    }
+
+    if let Some(home) = env::var_os("USERPROFILE") {
+        return Some(PathBuf::from(home));
+    }
+
+    let drive = env::var_os("HOMEDRIVE")?;
+    let path = env::var_os("HOMEPATH")?;
+    Some(PathBuf::from(drive).join(path))
 }
 
 fn path_to_str(path: &Path) -> Result<&str> {
@@ -1172,7 +1243,7 @@ fn print_help() {
 Options:\n  \
 --config <FILE>          Trigger config file [env: RIME_POC_CONFIG] [default: ./rime-poc.toml if present]\n  \
 --conversion-mode <MODE> Conversion mode: segmented or rime-auto [env: RIME_POC_CONVERSION_MODE]\n  \
---listen                 Start macOS global listener mode\n  \
+--listen                 Start global listener mode on macOS or Windows\n  \
 --log-events             Print every key/mouse event seen by the listener [env: RIME_POC_LOG_EVENTS]\n  \
 --body                   Treat input as body text without requiring trigger prefix/suffix\n  \
 --max-buffer-chars <N>   Maximum listener buffer length [env: RIME_POC_MAX_BUFFER_CHARS] [default: 4096]\n  \

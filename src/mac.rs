@@ -5,10 +5,9 @@ use std::{
 
 use anyhow::Result;
 
-pub const EVENT_KEYBOARD: i32 = 1;
-pub const EVENT_MOUSE: i32 = 2;
-pub const STATUS_PRESSED: i32 = 1;
+use super::InputEvent;
 
+pub const PLATFORM_NAME: &str = "macOS";
 pub const KEY_BACKSPACE: u32 = 51;
 pub const KEY_ENTER: u32 = 36;
 pub const KEY_RETURN: u32 = 76;
@@ -18,25 +17,21 @@ pub const KEY_ARROW_RIGHT: u32 = 124;
 pub const KEY_ARROW_DOWN: u32 = 125;
 pub const KEY_ARROW_UP: u32 = 126;
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct InputEvent {
-    pub event_type: c_int,
-    pub status: c_int,
-    pub key_code: c_uint,
-    pub buffer: [c_char; 64],
-    pub buffer_len: usize,
+pub fn is_backspace_key(key_code: u32) -> bool {
+    key_code == KEY_BACKSPACE
 }
 
-impl InputEvent {
-    pub fn text(&self) -> String {
-        let len = self.buffer_len.min(self.buffer.len());
-        let bytes = self.buffer[..len]
-            .iter()
-            .map(|ch| *ch as u8)
-            .collect::<Vec<_>>();
-        String::from_utf8_lossy(&bytes).into_owned()
-    }
+pub fn is_buffer_boundary_key(key_code: u32) -> bool {
+    matches!(
+        key_code,
+        KEY_ENTER
+            | KEY_RETURN
+            | KEY_ESCAPE
+            | KEY_ARROW_LEFT
+            | KEY_ARROW_RIGHT
+            | KEY_ARROW_DOWN
+            | KEY_ARROW_UP
+    )
 }
 
 pub fn is_accessibility_trusted(prompt: bool) -> bool {
